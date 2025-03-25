@@ -13,7 +13,8 @@ defmodule Minne.Upload do
           adapter: map() | atom() | nil,
           chunk_size: non_neg_integer(),
           remainder_bytes: binary() | nil,
-          request_url: String.t()
+          request_url: String.t(),
+          content_encoding: String.t() | nil
         }
 
   defstruct filename: "",
@@ -22,7 +23,8 @@ defmodule Minne.Upload do
             adapter: nil,
             chunk_size: 0,
             remainder_bytes: "",
-            request_url: ""
+            request_url: "",
+            content_encoding: nil
 
   def new(adapter) do
     %__MODULE__{adapter: adapter}

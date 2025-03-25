@@ -50,7 +50,11 @@ defmodule Minne.Adapter.S3 do
 
   @impl Minne.Adapter
   def start(upload, _opts) do
-    adapter = %{upload.adapter | key: gen_timestamp_uuid_key(upload.request_url)}
+    adapter = %{
+      upload.adapter
+      | key: gen_timestamp_uuid_key(upload.request_url) |> file_extension(upload)
+    }
+
     %{upload | adapter: adapter}
   end
 
@@ -80,6 +84,23 @@ defmodule Minne.Adapter.S3 do
     now = NaiveDateTime.utc_now()
 
     folder <> "/#{now.year}/#{pad(now.month)}/#{pad(now.day)}/#{pad(now.hour)}/" <> UUID.uuid4()
+  end
+
+  defp file_extension(file_key, %{content_type: type, content_encoding: encoding} = upload) do
+    file_key =
+      case type do
+        "application/json" -> file_key <> ".json"
+        "application/x-ndjson" -> file_key <> ".jsonl"
+        "application/gzf" -> file_key <> ".gzf"
+        "application/tar" -> file_key <> ".tar"
+        _ -> file_key
+      end
+
+    if encoding == "gzip" do
+      file_key <> ".gz"
+    else
+      file_key
+    end
   end
 
   defp pad(value) when value < 10, do: "0#{value}"

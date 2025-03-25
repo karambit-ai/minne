@@ -24,7 +24,7 @@ defmodule Minne.MixProject do
       {:plug, "~> 1.17"},
       {:ex_aws, "~> 2.2", optional: true},
       {:ex_aws_s3, "~> 2.5", optional: true},
-      {:hackney, "~> 1.20", optional: true},
+      {:hackney, "~> 1.23", optional: true},
       {:sweet_xml, "~> 0.6.6", optional: true},
 
       ### UUID generation

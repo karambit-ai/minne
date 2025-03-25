@@ -25,9 +25,10 @@ defmodule Minne.MixProject do
       {:ex_aws, "~> 2.2", optional: true},
       {:ex_aws_s3, "~> 2.5", optional: true},
       {:hackney, "~> 1.23", optional: true},
-      {:sweet_xml, "~> 0.6.6", optional: true}
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
+      {:sweet_xml, "~> 0.6.6", optional: true},
+
+      ### UUID generation
+      {:elixir_uuid, "~> 1.2"}
     ]
   end
 end

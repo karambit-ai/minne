@@ -199,6 +199,7 @@ defmodule Minne.Adapter.S3 do
           new_part_async = upload_async(uploaded, parts_count, chunk_to_process)
           adapter = adapter |> update_hashes(chunk_to_process)
 
+          # pass along remaining bytes that didn't fit in chunk.
           %{
             uploaded
             | size: size + uploaded.size,
@@ -209,8 +210,6 @@ defmodule Minne.Adapter.S3 do
                   parts: [new_part_async | uploaded.adapter.parts]
               }
           }
-
-          # ensure no more then 1 chunk worth of data is left in remaining
       end
 
     if byte_size(upload.remainder_bytes) >= chunk_size do

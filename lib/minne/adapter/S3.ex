@@ -212,6 +212,7 @@ defmodule Minne.Adapter.S3 do
           }
       end
 
+    # this logic allows us to set any upload chunk size
     if byte_size(upload.remainder_bytes) >= chunk_size do
       upload_part(upload, size, "", false)
     else

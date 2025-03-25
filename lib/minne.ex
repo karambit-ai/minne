@@ -23,6 +23,8 @@ defmodule Minne do
   @behaviour Plug.Parsers
   require Logger
 
+  import Plug.Conn
+
   alias __MODULE__
 
   @impl Plug.Parsers
@@ -47,17 +49,17 @@ defmodule Minne do
   @impl Plug.Parsers
   def parse(conn, "multipart", subtype, _headers, opts_tuple)
       when subtype in ["form-data", "mixed"] do
-    try do
-      parse_multipart(conn, opts_tuple)
-    rescue
-      # Do not ignore upload errors
-      e in [Plug.UploadError, Plug.Parsers.BadEncodingError] ->
-        reraise e, __STACKTRACE__
+    # try do
+    parse_multipart(conn, opts_tuple)
+    # rescue
+    #   # Do not ignore upload errors
+    #   e in [Plug.UploadError, Plug.Parsers.BadEncodingError] ->
+    #     reraise e, __STACKTRACE__
 
-      # All others are wrapped
-      e ->
-        reraise Plug.Parsers.ParseError.exception(exception: e), __STACKTRACE__
-    end
+    #   # All others are wrapped
+    #   e ->
+    #     reraise Plug.Parsers.ParseError.exception(exception: e), __STACKTRACE__
+    # end
   end
 
   def parse(conn, _type, _subtype, _headers, _opts) do
@@ -115,14 +117,19 @@ defmodule Minne do
         {conn, limit, [{name, %{headers: headers, body: body}} | acc]}
 
       {:file, name, upload} ->
+        upload = %{upload | request_url: conn.request_path}
         upload = apply(upload.adapter.__struct__, :start, [upload, opts[:adapter_opts]])
 
-        {:ok, limit, conn, upload} =
-          parse_multipart_file(Plug.Conn.read_part_body(conn, opts), limit, opts, upload)
+        case parse_multipart_file(Plug.Conn.read_part_body(conn, opts), limit, opts, upload) do
+          {:ok, limit, conn, upload} ->
+            upload = apply(upload.adapter.__struct__, :close, [upload, opts[:adapter_opts]])
 
-        upload = apply(upload.adapter.__struct__, :close, [upload, opts[:adapter_opts]])
+            {conn, limit, [{name, upload} | acc]}
 
-        {conn, limit, [{name, upload} | acc]}
+          # file limit hit or some other error has already been returned.
+          conn ->
+            {conn, limit, []}
+        end
 
       :skip ->
         {conn, limit, acc}
@@ -151,36 +158,80 @@ defmodule Minne do
   defp parse_multipart_file({:more, tail, conn}, limit, opts, upload) do
     chunk_size = byte_size(tail)
 
-    upload =
-      apply(upload.adapter.__struct__, :write_part, [
-        upload,
-        tail,
-        chunk_size,
-        opts[:adapter_opts]
-      ])
+    case apply(upload.adapter.__struct__, :write_part, [
+           upload,
+           tail,
+           chunk_size,
+           false,
+           opts[:adapter_opts]
+         ]) do
+      {:ok, upload} ->
+        Plug.Conn.read_part_body(conn, opts)
+        |> parse_multipart_file(limit - chunk_size, opts, upload)
 
-    # keep reading.
-    Plug.Conn.read_part_body(conn, opts)
-    |> parse_multipart_file(limit - chunk_size, opts, upload)
+      {:error, error} ->
+        send_error(conn, error)
+    end
   end
 
+  # {:ok, tail, conn} means this is the last chunk, so we need to make sure to
+  # finish processing any remainder_bytes
   defp parse_multipart_file({:ok, tail, conn}, limit, opts, upload)
        when byte_size(tail) <= limit do
     chunk_size = byte_size(tail)
 
-    upload =
-      apply(upload.adapter.__struct__, :write_part, [
-        upload,
-        tail,
-        chunk_size,
-        opts[:adapter_opts]
-      ])
+    # process final chunk
+    case apply(upload.adapter.__struct__, :write_part, [
+           upload,
+           tail,
+           chunk_size,
+           false,
+           opts[:adapter_opts]
+         ]) do
+      {:ok, upload} ->
+        remainder_bytes = upload.remainder_bytes
 
-    {:ok, limit - chunk_size, conn, upload}
+        # process final remaining bytes
+        if remainder_bytes == "" do
+          {:ok, limit - chunk_size, conn, upload}
+        else
+          upload = %{upload | remainder_bytes: ""}
+          chunk_size = byte_size(remainder_bytes)
+
+          case apply(upload.adapter.__struct__, :write_part, [
+                 upload,
+                 remainder_bytes,
+                 chunk_size,
+                 true,
+                 opts[:adapter_opts]
+               ]) do
+            {:ok, upload} -> {:ok, limit - chunk_size, conn, upload}
+            {:error, error} -> send_error(conn, error)
+          end
+        end
+
+      {:error, error} ->
+        send_error(conn, error)
+    end
+
+    # now write the final leftover chunk before finishing. if there are any.
   end
 
   defp parse_multipart_file({:ok, tail, conn}, limit, _opts, upload) do
     {:ok, limit - byte_size(tail), conn, upload}
+  end
+
+  defp send_error(conn, error) do
+    error_message = %{
+      error: to_string(error),
+      status: "error"
+    }
+
+    conn
+    |> put_resp_content_type("application/json")
+    # Note: encode the map to JSON
+    |> send_resp(422, Jason.encode!(error_message))
+    |> halt()
   end
 
   # for a full chunk, when uploading file > 5 mb

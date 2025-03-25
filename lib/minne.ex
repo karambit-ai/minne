@@ -189,13 +189,12 @@ defmodule Minne do
            opts[:adapter_opts]
          ]) do
       {:ok, upload} ->
+        # now write the final non-uniform chunk from remaining bytes
         process_remainder_bytes(conn, upload, chunk_size, limit, opts)
 
       {:error, error} ->
         send_error(conn, error)
     end
-
-    # now write the final leftover chunk before finishing. if there are any.
   end
 
   defp parse_multipart_file({:ok, tail, conn}, limit, _opts, upload) do

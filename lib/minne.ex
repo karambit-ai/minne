@@ -49,17 +49,17 @@ defmodule Minne do
   @impl Plug.Parsers
   def parse(conn, "multipart", subtype, _headers, opts_tuple)
       when subtype in ["form-data", "mixed"] do
-    # try do
-    parse_multipart(conn, opts_tuple)
-    # rescue
-    #   # Do not ignore upload errors
-    #   e in [Plug.UploadError, Plug.Parsers.BadEncodingError] ->
-    #     reraise e, __STACKTRACE__
+    try do
+      parse_multipart(conn, opts_tuple)
+    rescue
+      # Do not ignore upload errors
+      e in [Plug.UploadError, Plug.Parsers.BadEncodingError] ->
+        reraise e, __STACKTRACE__
 
-    #   # All others are wrapped
-    #   e ->
-    #     reraise Plug.Parsers.ParseError.exception(exception: e), __STACKTRACE__
-    # end
+      # All others are wrapped
+      e ->
+        reraise Plug.Parsers.ParseError.exception(exception: e), __STACKTRACE__
+    end
   end
 
   def parse(conn, _type, _subtype, _headers, _opts) do
@@ -189,26 +189,7 @@ defmodule Minne do
            opts[:adapter_opts]
          ]) do
       {:ok, upload} ->
-        remainder_bytes = upload.remainder_bytes
-
-        # process final remaining bytes
-        if remainder_bytes == "" do
-          {:ok, limit - chunk_size, conn, upload}
-        else
-          upload = %{upload | remainder_bytes: ""}
-          chunk_size = byte_size(remainder_bytes)
-
-          case apply(upload.adapter.__struct__, :write_part, [
-                 upload,
-                 remainder_bytes,
-                 chunk_size,
-                 true,
-                 opts[:adapter_opts]
-               ]) do
-            {:ok, upload} -> {:ok, limit - chunk_size, conn, upload}
-            {:error, error} -> send_error(conn, error)
-          end
-        end
+        process_remainder_bytes(conn, upload, chunk_size, limit, opts)
 
       {:error, error} ->
         send_error(conn, error)
@@ -219,6 +200,29 @@ defmodule Minne do
 
   defp parse_multipart_file({:ok, tail, conn}, limit, _opts, upload) do
     {:ok, limit - byte_size(tail), conn, upload}
+  end
+
+  defp process_remainder_bytes(conn, upload, chunk_size, limit, opts) do
+    remainder_bytes = upload.remainder_bytes
+
+    # process final remaining bytes
+    if remainder_bytes == "" do
+      {:ok, limit - chunk_size, conn, upload}
+    else
+      upload = %{upload | remainder_bytes: ""}
+      chunk_size = byte_size(remainder_bytes)
+
+      case apply(upload.adapter.__struct__, :write_part, [
+             upload,
+             remainder_bytes,
+             chunk_size,
+             true,
+             opts[:adapter_opts]
+           ]) do
+        {:ok, upload} -> {:ok, limit - chunk_size, conn, upload}
+        {:error, error} -> send_error(conn, error)
+      end
+    end
   end
 
   defp send_error(conn, error) do

@@ -114,7 +114,6 @@ defmodule Minne.Adapter.S3 do
         _opts
       ) do
     if upload.size + size <= max do
-      IO.inspect("hit max")
       upload = upload |> set_upload_id() |> upload_part(size, chunk, final?)
       {:ok, upload}
     else

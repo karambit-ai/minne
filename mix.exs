@@ -4,8 +4,8 @@ defmodule Minne.MixProject do
   def project do
     [
       app: :minne,
-      version: "0.1.0",
-      elixir: "~> 1.17",
+      version: "0.1.1",
+      elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
@@ -28,7 +28,11 @@ defmodule Minne.MixProject do
       {:sweet_xml, "~> 0.6.6", optional: true},
 
       ### UUID generation
-      {:elixir_uuid, "~> 1.2"}
+      {:elixir_uuid, "~> 1.2"},
+
+      # Static Analysis Tools
+      {:credo, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.0", only: [:dev, :test], runtime: false}
     ]
   end
 end

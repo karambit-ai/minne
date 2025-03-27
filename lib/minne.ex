@@ -23,6 +23,8 @@ defmodule Minne do
   @behaviour Plug.Parsers
   require Logger
 
+  import Plug.Conn
+
   alias __MODULE__
 
   @impl Plug.Parsers
@@ -115,14 +117,24 @@ defmodule Minne do
         {conn, limit, [{name, %{headers: headers, body: body}} | acc]}
 
       {:file, name, upload} ->
+        upload = %{
+          upload
+          | request_url: conn.request_path,
+            content_encoding: get_header(conn.req_headers, "content-encoding")
+        }
+
         upload = apply(upload.adapter.__struct__, :start, [upload, opts[:adapter_opts]])
 
-        {:ok, limit, conn, upload} =
-          parse_multipart_file(Plug.Conn.read_part_body(conn, opts), limit, opts, upload)
+        case parse_multipart_file(Plug.Conn.read_part_body(conn, opts), limit, opts, upload) do
+          {:ok, limit, conn, upload} ->
+            upload = apply(upload.adapter.__struct__, :close, [upload, opts[:adapter_opts]])
 
-        upload = apply(upload.adapter.__struct__, :close, [upload, opts[:adapter_opts]])
+            {conn, limit, [{name, upload} | acc]}
 
-        {conn, limit, [{name, upload} | acc]}
+          # file limit hit or some other error has already been returned.
+          conn ->
+            {conn, limit, []}
+        end
 
       :skip ->
         {conn, limit, acc}
@@ -151,36 +163,83 @@ defmodule Minne do
   defp parse_multipart_file({:more, tail, conn}, limit, opts, upload) do
     chunk_size = byte_size(tail)
 
-    upload =
-      apply(upload.adapter.__struct__, :write_part, [
-        upload,
-        tail,
-        chunk_size,
-        opts[:adapter_opts]
-      ])
+    case apply(upload.adapter.__struct__, :write_part, [
+           upload,
+           tail,
+           chunk_size,
+           false,
+           opts[:adapter_opts]
+         ]) do
+      {:ok, upload} ->
+        Plug.Conn.read_part_body(conn, opts)
+        |> parse_multipart_file(limit - chunk_size, opts, upload)
 
-    # keep reading.
-    Plug.Conn.read_part_body(conn, opts)
-    |> parse_multipart_file(limit - chunk_size, opts, upload)
+      {:error, error} ->
+        send_error(conn, error)
+    end
   end
 
+  # {:ok, tail, conn} means this is the last chunk, so we need to make sure to
+  # finish processing any remainder_bytes
   defp parse_multipart_file({:ok, tail, conn}, limit, opts, upload)
        when byte_size(tail) <= limit do
     chunk_size = byte_size(tail)
 
-    upload =
-      apply(upload.adapter.__struct__, :write_part, [
-        upload,
-        tail,
-        chunk_size,
-        opts[:adapter_opts]
-      ])
+    # process final chunk
+    case apply(upload.adapter.__struct__, :write_part, [
+           upload,
+           tail,
+           chunk_size,
+           false,
+           opts[:adapter_opts]
+         ]) do
+      {:ok, upload} ->
+        # now write the final non-uniform chunk from remaining bytes
+        process_remainder_bytes(conn, upload, chunk_size, limit, opts)
 
-    {:ok, limit - chunk_size, conn, upload}
+      {:error, error} ->
+        send_error(conn, error)
+    end
   end
 
   defp parse_multipart_file({:ok, tail, conn}, limit, _opts, upload) do
     {:ok, limit - byte_size(tail), conn, upload}
+  end
+
+  defp process_remainder_bytes(conn, upload, chunk_size, limit, opts) do
+    remainder_bytes = upload.remainder_bytes
+
+    # process final remaining bytes
+    if remainder_bytes == "" do
+      {:ok, limit - chunk_size, conn, upload}
+    else
+      upload = %{upload | remainder_bytes: ""}
+      chunk_size = byte_size(remainder_bytes)
+
+      case apply(upload.adapter.__struct__, :write_part, [
+             upload,
+             remainder_bytes,
+             chunk_size,
+             true,
+             opts[:adapter_opts]
+           ]) do
+        {:ok, upload} -> {:ok, limit - chunk_size, conn, upload}
+        {:error, error} -> send_error(conn, error)
+      end
+    end
+  end
+
+  defp send_error(conn, error) do
+    error_message = %{
+      error: to_string(error),
+      status: "error"
+    }
+
+    conn
+    |> put_resp_content_type("application/json")
+    # Note: encode the map to JSON
+    |> send_resp(422, Jason.encode!(error_message))
+    |> halt()
   end
 
   # for a full chunk, when uploading file > 5 mb

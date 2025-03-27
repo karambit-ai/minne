@@ -29,8 +29,8 @@ defmodule Minne.Adapter.Temp do
   end
 
   @impl Minne.Adapter
-  def write_part(upload, chunk, size, _opts) do
-    binwrite!(upload.adapter.file, chunk)
+  def write_part(upload, chunk, size, _, _opts) do
+    IO.binwrite(upload.adapter.file, chunk)
 
     %{upload | size: upload.size + size}
   end
@@ -39,17 +39,5 @@ defmodule Minne.Adapter.Temp do
   def close(upload, _opts) do
     :ok = File.close(upload.adapter.file)
     %{upload | adapter: %{upload.adapter | file: nil}}
-  end
-
-  defp binwrite!(device, contents) do
-    case IO.binwrite(device, contents) do
-      :ok ->
-        :ok
-
-      {:error, reason} ->
-        raise Plug.UploadError,
-              "could not write to file #{inspect(device)} during upload " <>
-                "due to reason: #{inspect(reason)}"
-    end
   end
 end

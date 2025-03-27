@@ -6,6 +6,7 @@ defmodule Minne.Adapter.S3 do
   # compile time is fine because these are not env vars
   @client Application.compile_env(:minne, :s3_client) || Minne.Clients.S3
   @min_chunk Application.compile_env(:minne, :chunk_size) || 5_242_880
+  @type path_function :: (String.t() -> String.t())
 
   @type t() :: %__MODULE__{
           key: String.t(),
@@ -14,7 +15,8 @@ defmodule Minne.Adapter.S3 do
           parts_count: non_neg_integer(),
           upload_id: String.t() | nil,
           hashes: map(),
-          max_file_size: non_neg_integer()
+          max_file_size: non_neg_integer(),
+          path_function: path_function | nil
         }
 
   defstruct key: "",
@@ -23,7 +25,8 @@ defmodule Minne.Adapter.S3 do
             parts_count: 0,
             upload_id: nil,
             hashes: %{},
-            max_file_size: 0
+            max_file_size: 0,
+            path_function: nil
 
   @impl Minne.Adapter
   def default_opts() do
@@ -39,6 +42,7 @@ defmodule Minne.Adapter.S3 do
           upload.adapter
           | bucket: opts[:bucket],
             max_file_size: opts[:max_file_size],
+            path_function: opts[:path_function],
             hashes: %{
               sha256: :crypto.hash_init(:sha256),
               sha1: :crypto.hash_init(:sha),
@@ -52,59 +56,11 @@ defmodule Minne.Adapter.S3 do
   def start(upload, _opts) do
     adapter = %{
       upload.adapter
-      | key: gen_timestamp_uuid_key(upload.request_url) |> file_extension(upload)
+      | key: upload.adapter.path_function.(upload)
     }
 
     %{upload | adapter: adapter}
   end
-
-  defp gen_timestamp_uuid_key(path) do
-    segments = String.split(path, "/", trim: true)
-
-    folder =
-      cond do
-        "upload" in segments ->
-          "bytes"
-
-        "kind" in segments ->
-          Enum.at(segments, 5)
-
-        "escalation" in segments ->
-          "escalation"
-
-        "files" in segments ->
-          "bytes"
-
-        true ->
-          error = "Invalid Kind provided when uploading to #{path}"
-          Logger.error(error)
-          raise RuntimeError, error
-      end
-
-    now = NaiveDateTime.utc_now()
-
-    folder <> "/#{now.year}/#{pad(now.month)}/#{pad(now.day)}/#{pad(now.hour)}/" <> UUID.uuid4()
-  end
-
-  defp file_extension(file_key, %{content_type: type, content_encoding: encoding} = upload) do
-    file_key =
-      case type do
-        "application/json" -> file_key <> ".json"
-        "application/x-ndjson" -> file_key <> ".jsonl"
-        "application/gzf" -> file_key <> ".gzf"
-        "application/tar" -> file_key <> ".tar"
-        _ -> file_key
-      end
-
-    if encoding == "gzip" do
-      file_key <> ".gz"
-    else
-      file_key
-    end
-  end
-
-  defp pad(value) when value < 10, do: "0#{value}"
-  defp pad(value), do: Integer.to_string(value)
 
   @impl Minne.Adapter
   def write_part(

@@ -27,18 +27,20 @@ Requires `ExAws.S3` and its dependencies.
 Will upload the file to S3 directly, never hitting the servers hardrive.
 
 ```elixir
-plug(Plug.Parsers,
-  parsers: [
-    {
-      Minne,
-      adapter: Minne.Adapter.S3
-      adapter_opts: [bucket: "some-bucket", upload_prefix: "upload"],
-    },
-    :urlencoded,
-    :json
-  ],
-  json_decoder: Jason
-)
+plug Plug.Parsers,
+       [
+         parsers: [
+           {Minne,
+            adapter: Minne.Adapter.S3,
+            adapter_opts: [
+              max_file_size: 1_000_000,
+              bucket_function: &MyModule.fetch_upload_bucket_name/0,
+              path_function: &MyModule.gen_upload_path/1
+            ]}
+         ],
+         pass: ["*/*"],
+         json_decoder: Phoenix.json_library()
+       ]
 ```
 
 ### Temp

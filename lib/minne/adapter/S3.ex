@@ -7,6 +7,7 @@ defmodule Minne.Adapter.S3 do
   @client Application.compile_env(:minne, :s3_client) || Minne.Clients.S3
   @min_chunk Application.compile_env(:minne, :chunk_size) || 5_242_880
   @type path_function :: (String.t() -> String.t())
+  @type bucket_function :: (-> String.t())
 
   @type t() :: %__MODULE__{
           key: String.t(),
@@ -16,7 +17,8 @@ defmodule Minne.Adapter.S3 do
           upload_id: String.t() | nil,
           hashes: map(),
           max_file_size: non_neg_integer(),
-          path_function: path_function | nil
+          path_function: path_function | nil,
+          bucket_function: bucket_function | nil
         }
 
   defstruct key: "",
@@ -26,7 +28,8 @@ defmodule Minne.Adapter.S3 do
             upload_id: nil,
             hashes: %{},
             max_file_size: 0,
-            path_function: nil
+            path_function: nil,
+            bucket_function: nil
 
   @impl Minne.Adapter
   def default_opts() do
@@ -36,28 +39,40 @@ defmodule Minne.Adapter.S3 do
 
   @impl Minne.Adapter
   def init(upload, opts) do
-    %{
-      upload
-      | adapter: %{
-          upload.adapter
-          | bucket: opts[:bucket],
-            max_file_size: opts[:max_file_size],
-            path_function: opts[:path_function],
-            hashes: %{
-              sha256: :crypto.hash_init(:sha256),
-              sha1: :crypto.hash_init(:sha),
-              md5: :crypto.hash_init(:md5)
+    case {opts[:bucket_function], opts[:path_function], opts[:max_file_size]} do
+      {nil, _, _} ->
+        {:error, "bucket_function is required to use minne's s3 adapter"}
+
+      {_, nil, _} ->
+        {:error, "path_function is required to use minne's s3 adapter"}
+
+      {_, _, nil} ->
+        {:error, "max_file_size is required to use minne's s3 adapter"}
+
+      {bucket_function, path_function, max_file_size} ->
+        %{
+          upload
+          | adapter: %{
+              upload.adapter
+              | bucket: bucket_function.(),
+                max_file_size: max_file_size,
+                path_function: path_function,
+                hashes: %{
+                  sha256: :crypto.hash_init(:sha256),
+                  sha1: :crypto.hash_init(:sha),
+                  md5: :crypto.hash_init(:md5)
+                }
             }
         }
-    }
+    end
   end
 
   @impl Minne.Adapter
   def start(upload, _opts) do
-    adapter = %{
-      upload.adapter
-      | key: upload.adapter.path_function.(upload)
-    }
+    key = upload.adapter.path_function.(upload)
+    Logger.info("Minne: uploading file to: #{upload.adapter.bucket}/#{key}")
+
+    adapter = %{upload.adapter | key: key}
 
     %{upload | adapter: adapter}
   end

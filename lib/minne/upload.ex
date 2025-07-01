@@ -14,7 +14,9 @@ defmodule Minne.Upload do
           chunk_size: non_neg_integer(),
           remainder_bytes: binary() | nil,
           request_url: String.t(),
-          content_encoding: String.t() | nil
+          content_encoding: String.t() | nil,
+          account_id: String.t() | nil,
+          private: :boolean | nil
         }
 
   defstruct filename: "",
@@ -24,7 +26,9 @@ defmodule Minne.Upload do
             chunk_size: 0,
             remainder_bytes: "",
             request_url: "",
-            content_encoding: nil
+            content_encoding: nil,
+            account_id: nil,
+            private: nil
 
   def new(adapter) do
     %__MODULE__{adapter: adapter}

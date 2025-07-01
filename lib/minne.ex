@@ -119,11 +119,18 @@ defmodule Minne do
         {conn, limit, [{name, %{headers: headers, body: body}} | acc]}
 
       {:file, name, upload} ->
-        upload = %{
-          upload
-          | request_url: conn.request_path,
-            content_encoding: get_header(conn.req_headers, "content-encoding")
-        }
+        auth_meta = Map.get(conn.assigns, :auth_meta, %{})
+        privacy = Map.get(conn.assigns, :privacy, :public)
+
+        upload =
+          %{
+            upload
+            | request_url: conn.request_path,
+              content_encoding: get_header(conn.req_headers, "content-encoding"),
+              account_id: Map.get(auth_meta, "account_id"),
+              private: privacy == :private
+          }
+          |> IO.inspect()
 
         upload = apply(upload.adapter.__struct__, :start, [upload, opts[:adapter_opts]])
 

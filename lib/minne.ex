@@ -130,7 +130,6 @@ defmodule Minne do
               account_id: Map.get(auth_meta, "account_id"),
               private: privacy == :private
           }
-          |> IO.inspect()
 
         upload = apply(upload.adapter.__struct__, :start, [upload, opts[:adapter_opts]])
 

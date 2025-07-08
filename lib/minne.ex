@@ -119,6 +119,7 @@ defmodule Minne do
         {conn, limit, [{name, %{headers: headers, body: body}} | acc]}
 
       {:file, name, upload} ->
+        # these fields can/will be ignored and defaulted to public if not provided for any reason
         auth_meta = Map.get(conn.assigns, :auth_meta, %{})
         privacy = Map.get(conn.assigns, :privacy, :public)
 

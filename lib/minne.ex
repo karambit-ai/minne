@@ -128,7 +128,6 @@ defmodule Minne do
             upload
             | request_url: conn.request_path,
               content_encoding: get_header(conn.req_headers, "content-encoding"),
-              account_id: Map.get(auth_meta, "account_id"),
               private: privacy == :private
           }
 

@@ -15,7 +15,6 @@ defmodule Minne.Upload do
           remainder_bytes: binary() | nil,
           request_url: String.t(),
           content_encoding: String.t() | nil,
-          account_id: String.t() | nil,
           private: :boolean | nil
         }
 
@@ -27,7 +26,6 @@ defmodule Minne.Upload do
             remainder_bytes: "",
             request_url: "",
             content_encoding: nil,
-            account_id: nil,
             private: nil
 
   def new(adapter) do

@@ -34,7 +34,7 @@ plug Plug.Parsers,
             adapter: Minne.Adapter.S3,
             adapter_opts: [
               max_file_size: 1_000_000,
-              bucket_function: &MyModule.fetch_upload_bucket_name/0,
+              bucket_function: &MyModule.fetch_upload_bucket_name/1,
               path_function: &MyModule.gen_upload_path/1
             ]}
          ],

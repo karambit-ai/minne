@@ -119,11 +119,16 @@ defmodule Minne do
         {conn, limit, [{name, %{headers: headers, body: body}} | acc]}
 
       {:file, name, upload} ->
-        upload = %{
-          upload
-          | request_url: conn.request_path,
-            content_encoding: get_header(conn.req_headers, "content-encoding")
-        }
+        # these fields can/will be ignored and defaulted to public if not provided for any reason
+        privacy = Map.get(conn.assigns, :privacy, :public)
+
+        upload =
+          %{
+            upload
+            | request_url: conn.request_path,
+              content_encoding: get_header(conn.req_headers, "content-encoding"),
+              private: privacy == :private
+          }
 
         upload = apply(upload.adapter.__struct__, :start, [upload, opts[:adapter_opts]])
 

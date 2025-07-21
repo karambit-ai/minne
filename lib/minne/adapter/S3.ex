@@ -6,8 +6,8 @@ defmodule Minne.Adapter.S3 do
   # compile time is fine because these are not env vars
   @client Application.compile_env(:minne, :s3_client) || Minne.Clients.S3
   @min_chunk Application.compile_env(:minne, :chunk_size) || 5_242_880
-  @type path_function :: (String.t() -> String.t())
-  @type bucket_function :: (-> String.t())
+  @type path_function :: (map() -> String.t())
+  @type bucket_function :: (map() -> String.t())
 
   @type t() :: %__MODULE__{
           key: String.t(),
@@ -16,6 +16,7 @@ defmodule Minne.Adapter.S3 do
           parts_count: non_neg_integer(),
           upload_id: String.t() | nil,
           hashes: map(),
+          private: :boolean | nil,
           max_file_size: non_neg_integer(),
           path_function: path_function | nil,
           bucket_function: bucket_function | nil
@@ -29,7 +30,8 @@ defmodule Minne.Adapter.S3 do
             hashes: %{},
             max_file_size: 0,
             path_function: nil,
-            bucket_function: nil
+            bucket_function: nil,
+            private: nil
 
   @impl Minne.Adapter
   def default_opts() do
@@ -54,7 +56,7 @@ defmodule Minne.Adapter.S3 do
           upload
           | adapter: %{
               upload.adapter
-              | bucket: bucket_function.(),
+              | bucket_function: bucket_function,
                 max_file_size: max_file_size,
                 path_function: path_function,
                 hashes: %{
@@ -69,10 +71,11 @@ defmodule Minne.Adapter.S3 do
 
   @impl Minne.Adapter
   def start(upload, _opts) do
-    key = upload.adapter.path_function.(upload)
-    Logger.info("Minne: uploading file to: #{upload.adapter.bucket}/#{key}")
+    {key, private?} = upload.adapter.path_function.(upload)
+    bucket = upload.adapter.bucket_function.(upload)
+    Logger.info("Minne: uploading file to: #{bucket}/#{key}")
 
-    adapter = %{upload.adapter | key: key}
+    adapter = %{upload.adapter | key: key, bucket: bucket, private: private?}
 
     %{upload | adapter: adapter}
   end

@@ -117,13 +117,23 @@ defmodule Minne.Adapter.S3 do
     end
   end
 
-  # upload didnt start yet, nothing to abort
-  defp abort_upload(%{adapter: %{parts: []}}) do
-    %{}
-  end
+  # upload didn't start yet, nothing to abort
+  defp abort_upload(%{adapter: %{upload_id: nil}}), do: :ok
 
-  defp abort_upload(%{adapter: %{bucket: bucket, key: key, upload_id: upload_id}}) do
+  defp abort_upload(%{
+         adapter: %{bucket: bucket, key: key, upload_id: upload_id, parts: parts}
+       }) do
+    Enum.each(parts, &Task.shutdown(&1, :brutal_kill))
+
     @client.abort_multipart_upload(bucket, key, upload_id)
+  rescue
+    error ->
+      Logger.error("Minne: failed to abort multipart upload: #{Exception.message(error)}")
+      :ok
+  catch
+    kind, reason ->
+      Logger.error("Minne: failed to abort multipart upload: #{inspect({kind, reason})}")
+      :ok
   end
 
   @impl Minne.Adapter
@@ -137,16 +147,27 @@ defmodule Minne.Adapter.S3 do
         } = upload,
         _opts
       ) do
-    reversed_parts = Enum.map(parts, fn p -> Task.await(p, 10000) end) |> Enum.reverse()
+    try do
+      reversed_parts = Enum.map(parts, &await_part/1) |> Enum.reverse()
 
-    @client.complete_multipart_upload(
-      bucket,
-      key,
-      upload_id,
-      reversed_parts
-    )
+      @client.complete_multipart_upload(
+        bucket,
+        key,
+        upload_id,
+        reversed_parts
+      )
 
-    %{upload | adapter: %{adapter | parts: reversed_parts}}
+      adapter = adapter |> Map.put(:parts, reversed_parts) |> finalize_hashes_if_pending()
+      %{upload | adapter: adapter}
+    rescue
+      error ->
+        abort_upload(upload)
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        abort_upload(upload)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
   end
 
   defp set_upload_id(%{adapter: %{upload_id: nil, bucket: bucket, key: key} = adapter} = uploaded) do
@@ -253,17 +274,30 @@ defmodule Minne.Adapter.S3 do
   # launches async task to upload this part.
   defp upload_async(uploaded, parts_count, chunk) do
     Task.async(fn ->
-      %{headers: headers} =
-        @client.upload_part(
-          uploaded.adapter.bucket,
-          uploaded.adapter.key,
-          uploaded.adapter.upload_id,
-          parts_count,
-          chunk
-        )
+      try do
+        %{headers: headers} =
+          @client.upload_part(
+            uploaded.adapter.bucket,
+            uploaded.adapter.key,
+            uploaded.adapter.upload_id,
+            parts_count,
+            chunk
+          )
 
-      {parts_count, Minne.get_header(headers, "ETag")}
+        {:ok, {parts_count, Minne.get_header(headers, "ETag")}}
+      rescue
+        error -> {:error, :error, error, __STACKTRACE__}
+      catch
+        kind, reason -> {:error, kind, reason, __STACKTRACE__}
+      end
     end)
+  end
+
+  defp await_part(task) do
+    case Task.await(task, 10_000) do
+      {:ok, part} -> part
+      {:error, kind, reason, stacktrace} -> :erlang.raise(kind, reason, stacktrace)
+    end
   end
 
   defp update_hashes(%{hashes: %{sha256: sha256, md5: md5, sha1: sha}} = adapter, chunk) do
@@ -285,4 +319,10 @@ defmodule Minne.Adapter.S3 do
 
     %{adapter | hashes: hashes}
   end
+
+  defp finalize_hashes_if_pending(%{hashes: %{sha256: digest}} = adapter)
+       when is_binary(digest),
+       do: adapter
+
+  defp finalize_hashes_if_pending(adapter), do: finalize_hashes(adapter)
 end

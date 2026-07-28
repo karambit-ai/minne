@@ -40,4 +40,11 @@ defmodule Minne.Adapter.Temp do
     :ok = File.close(upload.adapter.file)
     %{upload | adapter: %{upload.adapter | file: nil}}
   end
+
+  @impl Minne.Adapter
+  def abort(upload, _opts) do
+    if upload.adapter.file, do: File.close(upload.adapter.file)
+    File.rm(upload.adapter.path)
+    :ok
+  end
 end

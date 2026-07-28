@@ -1,26 +1,8 @@
 defmodule Minne.Adapter.S3 do
   require Logger
-  alias Minne.Upload
   @behaviour Minne.Adapter
 
-  # compile time is fine because these are not env vars
-  @client Application.compile_env(:minne, :s3_client) || Minne.Clients.S3
   @min_chunk Application.compile_env(:minne, :chunk_size) || 5_242_880
-  @type path_function :: (map() -> String.t())
-  @type bucket_function :: (map() -> String.t())
-
-  @type t() :: %__MODULE__{
-          key: String.t(),
-          bucket: String.t(),
-          parts: list(),
-          parts_count: non_neg_integer(),
-          upload_id: String.t() | nil,
-          hashes: map(),
-          private: :boolean | nil,
-          max_file_size: non_neg_integer(),
-          path_function: path_function | nil,
-          bucket_function: bucket_function | nil
-        }
 
   defstruct key: "",
             bucket: "",
@@ -34,10 +16,7 @@ defmodule Minne.Adapter.S3 do
             private: nil
 
   @impl Minne.Adapter
-  def default_opts() do
-    # might want to make this length adjustable, but for the most part, is OK as S3 can handle pretty much anything.
-    [length: 16_000_000_000, read_length: @min_chunk]
-  end
+  def default_opts, do: [length: 16_000_000_000, read_length: @min_chunk]
 
   @impl Minne.Adapter
   def init(upload, opts) do
@@ -52,20 +31,15 @@ defmodule Minne.Adapter.S3 do
         {:error, "max_file_size is required to use minne's s3 adapter"}
 
       {bucket_function, path_function, max_file_size} ->
-        %{
-          upload
-          | adapter: %{
-              upload.adapter
-              | bucket_function: bucket_function,
-                max_file_size: max_file_size,
-                path_function: path_function,
-                hashes: %{
-                  sha256: :crypto.hash_init(:sha256),
-                  sha1: :crypto.hash_init(:sha),
-                  md5: :crypto.hash_init(:md5)
-                }
-            }
+        adapter = %{
+          upload.adapter
+          | bucket_function: bucket_function,
+            path_function: path_function,
+            max_file_size: max_file_size,
+            hashes: new_hashes()
         }
+
+        %{upload | adapter: adapter}
     end
   end
 
@@ -73,59 +47,81 @@ defmodule Minne.Adapter.S3 do
   def start(upload, _opts) do
     {key, private?} = upload.adapter.path_function.(upload)
     bucket = upload.adapter.bucket_function.(upload)
-    Logger.info("Minne: uploading file to: #{bucket}/#{key}")
-
-    adapter = %{upload.adapter | key: key, bucket: bucket, private: private?}
-
-    %{upload | adapter: adapter}
+    Logger.info("Minne: buffering upload for: #{bucket}/#{key}")
+    %{upload | adapter: %{upload.adapter | key: key, bucket: bucket, private: private?}}
   end
 
   @impl Minne.Adapter
-  def write_part(
-        %Upload{adapter: %__MODULE__{parts_count: parts_count} = adapter} = upload,
-        chunk,
-        size,
-        _final?,
-        _opts
-      )
-      when size < @min_chunk and parts_count == 0 do
-    @client.put_object(upload.adapter.bucket, upload.adapter.key, chunk)
-
-    adapter = adapter |> update_hashes(chunk) |> finalize_hashes()
-
-    {:ok,
-     %{
-       upload
-       | size: size + upload.size,
-         adapter: adapter
-     }}
-  end
-
-  def write_part(
-        %Upload{adapter: %{max_file_size: max}} = upload,
-        chunk,
-        size,
-        final?,
-        _opts
-      ) do
-    if upload.size + size <= max do
-      upload = upload |> set_upload_id() |> upload_part(size, chunk, final?)
-      {:ok, upload}
+  def write_part(upload, chunk, size, _final?, _opts) do
+    if upload.size + size > upload.adapter.max_file_size do
+      abort(upload, [])
+      {:error, :too_large}
     else
-      abort_upload(upload)
-      {:error, "#{upload.request_url} only supports files smaller than (#{max / 1_048_576} MB)"}
+      upload = %{
+        upload
+        | size: upload.size + size,
+          remainder_bytes: upload.remainder_bytes <> chunk,
+          adapter: update_hashes(upload.adapter, chunk)
+      }
+
+      {:ok, flush_full_parts(upload)}
     end
   end
 
-  # upload didn't start yet, nothing to abort
-  defp abort_upload(%{adapter: %{upload_id: nil}}), do: :ok
+  @impl Minne.Adapter
+  def close(%{adapter: %{upload_id: nil}} = upload, _opts) do
+    if upload.size > upload.adapter.max_file_size, do: raise("upload exceeds max_file_size")
+    client().put_object(upload.adapter.bucket, upload.adapter.key, upload.remainder_bytes)
 
-  defp abort_upload(%{
-         adapter: %{bucket: bucket, key: key, upload_id: upload_id, parts: parts}
-       }) do
-    Enum.each(parts, &Task.shutdown(&1, :brutal_kill))
+    %{
+      upload
+      | remainder_bytes: "",
+        adapter: finalize_hashes(upload.adapter)
+    }
+  end
 
-    @client.abort_multipart_upload(bucket, key, upload_id)
+  def close(upload, _opts) do
+    upload = flush_remainder(upload)
+
+    try do
+      parts = upload.adapter.parts |> Enum.map(&await_part/1) |> Enum.reverse()
+
+      client().complete_multipart_upload(
+        upload.adapter.bucket,
+        upload.adapter.key,
+        upload.adapter.upload_id,
+        parts
+      )
+
+      adapter = upload.adapter |> Map.put(:parts, parts) |> finalize_hashes()
+      %{upload | adapter: adapter}
+    rescue
+      error ->
+        abort(upload, [])
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        abort(upload, [])
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    end
+  end
+
+  @impl Minne.Adapter
+  def abort(%{adapter: %{upload_id: nil}}, _opts), do: :ok
+
+  def abort(upload, _opts) do
+    Enum.each(upload.adapter.parts, fn
+      %Task{} = task -> Task.shutdown(task, :brutal_kill)
+      _completed_part -> :ok
+    end)
+
+    client().abort_multipart_upload(
+      upload.adapter.bucket,
+      upload.adapter.key,
+      upload.adapter.upload_id
+    )
+
+    :ok
   rescue
     error ->
       Logger.error("Minne: failed to abort multipart upload: #{Exception.message(error)}")
@@ -136,155 +132,51 @@ defmodule Minne.Adapter.S3 do
       :ok
   end
 
-  @impl Minne.Adapter
-  def close(%{adapter: %{upload_id: nil}} = upload, _opts) do
-    upload
+  defp flush_full_parts(upload) when byte_size(upload.remainder_bytes) < @min_chunk, do: upload
+
+  defp flush_full_parts(upload) do
+    upload = ensure_upload_id(upload)
+    <<chunk::binary-size(@min_chunk), remainder::binary>> = upload.remainder_bytes
+    upload = enqueue_part(%{upload | remainder_bytes: remainder}, chunk)
+    flush_full_parts(upload)
   end
 
-  def close(
-        %{
-          adapter: %{upload_id: upload_id, bucket: bucket, key: key, parts: parts} = adapter
-        } = upload,
-        _opts
-      ) do
-    try do
-      reversed_parts = Enum.map(parts, &await_part/1) |> Enum.reverse()
+  defp flush_remainder(%{remainder_bytes: ""} = upload), do: upload
 
-      @client.complete_multipart_upload(
-        bucket,
-        key,
-        upload_id,
-        reversed_parts
-      )
-
-      adapter = adapter |> Map.put(:parts, reversed_parts) |> finalize_hashes_if_pending()
-      %{upload | adapter: adapter}
-    rescue
-      error ->
-        abort_upload(upload)
-        reraise error, __STACKTRACE__
-    catch
-      kind, reason ->
-        abort_upload(upload)
-        :erlang.raise(kind, reason, __STACKTRACE__)
-    end
+  defp flush_remainder(upload) do
+    chunk = upload.remainder_bytes
+    enqueue_part(%{upload | remainder_bytes: ""}, chunk)
   end
 
-  defp set_upload_id(%{adapter: %{upload_id: nil, bucket: bucket, key: key} = adapter} = uploaded) do
+  defp ensure_upload_id(%{adapter: %{upload_id: nil} = adapter} = upload) do
     %{body: %{upload_id: upload_id}} =
-      @client.initiate_multipart_upload(bucket, key)
+      client().initiate_multipart_upload(adapter.bucket, adapter.key)
 
-    %{uploaded | adapter: %{adapter | upload_id: upload_id}}
+    %{upload | adapter: %{adapter | upload_id: upload_id}}
   end
 
-  defp set_upload_id(%{adapter: %{upload_id: _upload_id}} = uploaded), do: uploaded
+  defp ensure_upload_id(upload), do: upload
 
-  # this represents the first chunk.
-  # since its always a jacked up size, we batch the first chunk with the second.
-  defp upload_part(%{chunk_size: 0} = uploaded, size, chunk, false) do
-    upload = %{
-      uploaded
-      | chunk_size: @min_chunk
-    }
-
-    # this moves the chunk to the "remaining" flow to be picked up by the 2ed chunk and so on.
-    upload_part(upload, size, chunk, false)
+  defp enqueue_part(upload, chunk) do
+    count = upload.adapter.parts_count + 1
+    task = upload_async(upload, count, chunk)
+    adapter = %{upload.adapter | parts_count: count, parts: [task | upload.adapter.parts]}
+    %{upload | adapter: adapter}
   end
 
-  # all upload chunks need to be the same size, except the last chunk.
-  defp upload_part(
-         %{chunk_size: chunk_size, remainder_bytes: remainder, adapter: adapter} = uploaded,
-         size,
-         chunk,
-         false
-       ) do
-    chunk = remainder <> chunk
-
-    upload =
-      case extract_chunk(chunk, chunk_size) do
-        {<<>>, remaining} ->
-          %{
-            uploaded
-            | remainder_bytes: remaining
-          }
-
-        {chunk_to_process, remaining} ->
-          size = byte_size(chunk_to_process)
-          parts_count = uploaded.adapter.parts_count + 1
-
-          new_part_async = upload_async(uploaded, parts_count, chunk_to_process)
-          adapter = adapter |> update_hashes(chunk_to_process)
-
-          # pass along remaining bytes that didn't fit in chunk.
-          %{
-            uploaded
-            | size: size + uploaded.size,
-              remainder_bytes: remaining,
-              adapter: %{
-                adapter
-                | parts_count: parts_count,
-                  parts: [new_part_async | uploaded.adapter.parts]
-              }
-          }
-      end
-
-    # this logic allows us to set any upload chunk size
-    if byte_size(upload.remainder_bytes) >= chunk_size do
-      upload_part(upload, size, "", false)
-    else
-      upload
-    end
-  end
-
-  # ensure final remaining bytes are uploaded
-  defp upload_part(
-         %{adapter: adapter} = uploaded,
-         _size,
-         remaining_bytes,
-         true
-       ) do
-    size = byte_size(remaining_bytes)
-    parts_count = uploaded.adapter.parts_count + 1
-
-    new_part_async = upload_async(uploaded, parts_count, remaining_bytes)
-    adapter = adapter |> update_hashes(remaining_bytes) |> finalize_hashes()
-
-    %{
-      uploaded
-      | size: size + uploaded.size,
-        remainder_bytes: "",
-        adapter: %{
-          adapter
-          | parts_count: parts_count,
-            parts: [new_part_async | uploaded.adapter.parts]
-        }
-    }
-  end
-
-  defp extract_chunk(data, size) do
-    if byte_size(data) >= size do
-      <<chunk::binary-size(size), remainder::binary>> = data
-      {chunk, remainder}
-    else
-      # Not enough data to form a full chunk yet
-      {<<>>, data}
-    end
-  end
-
-  # launches async task to upload this part.
-  defp upload_async(uploaded, parts_count, chunk) do
+  defp upload_async(upload, number, chunk) do
     Task.async(fn ->
       try do
         %{headers: headers} =
-          @client.upload_part(
-            uploaded.adapter.bucket,
-            uploaded.adapter.key,
-            uploaded.adapter.upload_id,
-            parts_count,
+          client().upload_part(
+            upload.adapter.bucket,
+            upload.adapter.key,
+            upload.adapter.upload_id,
+            number,
             chunk
           )
 
-        {:ok, {parts_count, Minne.get_header(headers, "ETag")}}
+        {:ok, {number, Minne.get_header(headers, "ETag")}}
       rescue
         error -> {:error, :error, error, __STACKTRACE__}
       catch
@@ -300,29 +192,38 @@ defmodule Minne.Adapter.S3 do
     end
   end
 
-  defp update_hashes(%{hashes: %{sha256: sha256, md5: md5, sha1: sha}} = adapter, chunk) do
+  defp new_hashes do
+    %{
+      sha256: :crypto.hash_init(:sha256),
+      sha1: :crypto.hash_init(:sha),
+      md5: :crypto.hash_init(:md5)
+    }
+  end
+
+  defp update_hashes(%{hashes: hashes} = adapter, chunk) do
     hashes = %{
-      sha256: :crypto.hash_update(sha256, chunk),
-      sha1: :crypto.hash_update(sha, chunk),
-      md5: :crypto.hash_update(md5, chunk)
+      sha256: :crypto.hash_update(hashes.sha256, chunk),
+      sha1: :crypto.hash_update(hashes.sha1, chunk),
+      md5: :crypto.hash_update(hashes.md5, chunk)
     }
 
     %{adapter | hashes: hashes}
   end
 
-  defp finalize_hashes(%{hashes: %{sha256: sha256, md5: md5, sha1: sha}} = adapter) do
+  defp finalize_hashes(%{hashes: %{sha256: digest}} = adapter) when is_binary(digest),
+    do: adapter
+
+  defp finalize_hashes(%{hashes: hashes} = adapter) do
     hashes = %{
-      sha256: :crypto.hash_final(sha256) |> Base.encode16(case: :lower),
-      sha1: :crypto.hash_final(sha) |> Base.encode16(case: :lower),
-      md5: :crypto.hash_final(md5) |> Base.encode16(case: :lower)
+      sha256: encode_hash(hashes.sha256),
+      sha1: encode_hash(hashes.sha1),
+      md5: encode_hash(hashes.md5)
     }
 
     %{adapter | hashes: hashes}
   end
 
-  defp finalize_hashes_if_pending(%{hashes: %{sha256: digest}} = adapter)
-       when is_binary(digest),
-       do: adapter
+  defp encode_hash(state), do: state |> :crypto.hash_final() |> Base.encode16(case: :lower)
 
-  defp finalize_hashes_if_pending(adapter), do: finalize_hashes(adapter)
+  defp client, do: Application.get_env(:minne, :s3_client, Minne.Clients.S3)
 end

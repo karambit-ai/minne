@@ -1,325 +1,388 @@
 defmodule Minne do
   @moduledoc """
-  Parses multipart request body, file handling is configurable via adapters.
+  Parses multipart request bodies while streaming files through a configurable adapter.
 
-  ## Options
-    * `:adapter` - defines behaviour for multipart file handling
-    * `:adapter_opts` - options for the specified adapter, see the adapter for details
-
-  Besides the options supported by `Plug.Conn.read_body/2`, the multipart parser
-  also checks for:
-    * `:headers` - containing the same `:length`, `:read_length`
-      and `:read_timeout` options which are used explicitly for parsing multipart
-      headers.
-    * `:include_unnamed_parts_at` - string specifying a body parameter that can
-      hold a lists of body parts that didn't have a 'Content-Disposition' header.
-      For instance, `include_unnamed_parts_at: "_parts"` would result in
-      a body parameter `"_parts"`, containing a list of parts, each with `:body`
-      and `:headers` fields, like `[%{body: "{}", headers: [{"content-type", "application/json"}]}]`.
-  * `:validate_utf8` - specifies whether multipart body parts should be validated
-      as utf8 binaries. Defaults to true.
+  The optional policy settings `:allowed_file_fields`, `:allowed_scalar_fields`,
+  `:required_file_count`, and `:max_file_size` restrict multipart forms. Scalar
+  fields may be a map or keyword list from field name to its individual byte limit.
+  When no policy settings are supplied, multipart fields retain their general,
+  unrestricted behaviour.
   """
 
   @behaviour Plug.Parsers
   require Logger
 
-  import Plug.Conn
-
   alias __MODULE__
+
+  @tracker {__MODULE__, :uploads}
 
   @impl Plug.Parsers
   def init(opts) do
     adapter = Keyword.get(opts, :adapter) || raise "Must supply adapter in options"
-    default_adapter_opts = apply(adapter, :default_opts, [])
-
-    # Remove the length from options as it would attempt
-    # to eagerly read the body on the limit value.
-    {limit, opts} = Keyword.pop(opts, :length, default_adapter_opts[:length])
-
-    # The read length is now our effective length per call.
-    {read_length, opts} = Keyword.pop(opts, :read_length, default_adapter_opts[:read_length])
-    opts = [length: read_length, read_length: read_length] ++ opts
-
-    # The header options are handled individually.
+    defaults = apply(adapter, :default_opts, [])
+    {limit, opts} = Keyword.pop(opts, :length, defaults[:length])
+    {read_length, opts} = Keyword.pop(opts, :read_length, defaults[:read_length])
     {headers_opts, opts} = Keyword.pop(opts, :headers, [])
-
-    {limit, headers_opts, opts}
+    {limit, headers_opts, [length: read_length, read_length: read_length] ++ opts}
   end
 
   @impl Plug.Parsers
-  def parse(conn, "multipart", subtype, _headers, opts_tuple)
+  def parse(conn, "multipart", subtype, _headers, opts)
       when subtype in ["form-data", "mixed"] do
+    Process.put(@tracker, [])
+
     try do
-      parse_multipart(conn, opts_tuple)
+      result = parse_multipart(conn, opts)
+
+      case result do
+        {:ok, _, _} -> :ok
+        _ -> abort_tracked(opts)
+      end
+
+      result
     rescue
-      # Do not ignore upload errors
       e in [Plug.UploadError, Plug.Parsers.BadEncodingError] ->
+        abort_tracked(opts)
         Logger.error("Minne: #{inspect(e)}")
         reraise e, __STACKTRACE__
 
-      # All others are wrapped
       e ->
-        Logger.error("Minne: #{inspect(e)}")
+        abort_tracked(opts)
+        Logger.error("Minne multipart parse failed: #{Exception.message(e)}")
         reraise Plug.Parsers.ParseError.exception(exception: e), __STACKTRACE__
+    catch
+      kind, reason ->
+        abort_tracked(opts)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    after
+      Process.delete(@tracker)
     end
   end
 
-  def parse(conn, _type, _subtype, _headers, _opts) do
-    {:next, conn}
-  end
+  def parse(conn, _type, _subtype, _headers, _opts), do: {:next, conn}
 
-  ## Multipart
-
-  defp parse_multipart(conn, {{module, fun, args}, header_opts, opts}) do
-    limit = apply(module, fun, args)
-    parse_multipart(conn, {limit, header_opts, opts})
+  defp parse_multipart(conn, {{module, fun, args}, headers, opts}) do
+    parse_multipart(conn, {apply(module, fun, args), headers, opts})
   end
 
   defp parse_multipart(conn, {limit, headers_opts, opts}) do
-    read_result = Plug.Conn.read_part_headers(conn, headers_opts)
-    {:ok, limit, acc, conn} = parse_multipart(read_result, limit, opts, headers_opts, [])
+    state = %{limit: limit, acc: [], uploads: [], file_count: 0}
 
-    if limit > 0 do
-      {:ok, Enum.reduce(acc, %{}, &Plug.Conn.Query.decode_pair/2), conn}
-    else
-      {:error, :too_large, conn}
+    case parse_parts(Plug.Conn.read_part_headers(conn, headers_opts), state, opts, headers_opts) do
+      {:ok, state, conn} ->
+        validate_terminal!(state, opts)
+        uploads = close_uploads(state.uploads, opts)
+        acc = replace_uploads(state.acc, uploads)
+        {:ok, Enum.reduce(acc, %{}, &Plug.Conn.Query.decode_pair/2), conn}
+
+      {:too_large, conn} ->
+        {:error, :too_large, conn}
     end
   end
 
-  defp parse_multipart({:ok, headers, conn}, limit, opts, headers_opts, acc) when limit >= 0 do
-    {conn, limit, acc} = parse_multipart_headers(headers, conn, limit, opts, acc)
-    read_result = Plug.Conn.read_part_headers(conn, headers_opts)
-    parse_multipart(read_result, limit, opts, headers_opts, acc)
+  defp parse_parts({:done, conn}, state, _opts, _headers_opts), do: {:ok, state, conn}
+
+  defp parse_parts({:ok, headers, conn}, state, opts, headers_opts) do
+    case parse_part(headers, conn, state, opts) do
+      {:ok, state, conn} ->
+        parse_parts(Plug.Conn.read_part_headers(conn, headers_opts), state, opts, headers_opts)
+
+      {:too_large, conn} ->
+        {:too_large, conn}
+    end
   end
 
-  defp parse_multipart({:ok, _headers, conn}, limit, _opts, _headers_opts, acc) do
-    {:ok, limit, acc, conn}
-  end
-
-  defp parse_multipart({:done, conn}, limit, _opts, _headers_opts, acc) do
-    {:ok, limit, acc, conn}
-  end
-
-  defp parse_multipart_headers(headers, conn, limit, opts, acc) do
+  defp parse_part(headers, conn, state, opts) do
     case multipart_type(headers, opts) do
       {:binary, name} ->
-        {:ok, limit, body, conn} =
-          parse_multipart_body(Plug.Conn.read_part_body(conn, opts), limit, opts, "")
-
-        if Keyword.get(opts, :validate_utf8, true) do
-          Plug.Conn.Utils.validate_utf8!(body, Plug.Parsers.BadEncodingError, "multipart body")
-        end
-
-        {conn, limit, [{name, body} | acc]}
+        parse_scalar(name, headers, conn, state, opts, false)
 
       {:part, name} ->
-        {:ok, limit, body, conn} =
-          parse_multipart_body(Plug.Conn.read_part_body(conn, opts), limit, opts, "")
-
-        {conn, limit, [{name, %{headers: headers, body: body}} | acc]}
+        parse_scalar(name, headers, conn, state, opts, true)
 
       {:file, name, upload} ->
-        # these fields can/will be ignored and defaulted to public if not provided for any reason
-        privacy = Map.get(conn.assigns, :privacy, :public)
+        parse_file(name, upload, conn, state, opts)
 
-        upload =
-          %{
-            upload
-            | request_url: conn.request_path,
-              content_encoding: get_header(conn.req_headers, "content-encoding"),
-              private: privacy == :private
-          }
-
-        upload = apply(upload.adapter.__struct__, :start, [upload, opts[:adapter_opts]])
-
-        case parse_multipart_file(Plug.Conn.read_part_body(conn, opts), limit, opts, upload) do
-          {:ok, limit, conn, upload} ->
-            upload = apply(upload.adapter.__struct__, :close, [upload, opts[:adapter_opts]])
-
-            {conn, limit, [{name, upload} | acc]}
-
-          # file limit hit or some other error has already been returned.
-          conn ->
-            {conn, limit, []}
+      {:empty_file, name} ->
+        if policy?(opts) do
+          raise "file field #{inspect(name)} has no filename"
+        else
+          {:ok, state, conn}
         end
 
       :skip ->
-        {conn, limit, acc}
+        if policy?(opts), do: raise("malformed or unnamed multipart field")
+        {:ok, state, conn}
     end
   end
 
-  defp parse_multipart_body({:more, tail, conn}, limit, opts, body)
-       when limit >= byte_size(tail) do
-    read_result = Plug.Conn.read_part_body(conn, opts)
-    parse_multipart_body(read_result, limit - byte_size(tail), opts, body <> tail)
-  end
+  defp parse_scalar(name, headers, conn, state, opts, unnamed?) do
+    scalar_limit = scalar_limit!(name, opts)
+    scalar_opts = scalar_read_opts(opts, scalar_limit)
 
-  defp parse_multipart_body({:more, tail, conn}, limit, _opts, body) do
-    {:ok, limit - byte_size(tail), body, conn}
-  end
+    case read_scalar(
+           Plug.Conn.read_part_body(conn, scalar_opts),
+           state.limit,
+           scalar_limit,
+           scalar_opts,
+           []
+         ) do
+      {:ok, body, limit, conn} ->
+        if Keyword.get(opts, :validate_utf8, true) and not unnamed? do
+          Plug.Conn.Utils.validate_utf8!(body, Plug.Parsers.BadEncodingError, "multipart body")
+        end
 
-  defp parse_multipart_body({:ok, tail, conn}, limit, _opts, body)
-       when limit >= byte_size(tail) do
-    {:ok, limit - byte_size(tail), body <> tail, conn}
-  end
+        value = if unnamed?, do: %{headers: headers, body: body}, else: body
+        {:ok, %{state | limit: limit, acc: [{name, value} | state.acc]}, conn}
 
-  defp parse_multipart_body({:ok, tail, conn}, limit, _opts, body) do
-    {:ok, limit - byte_size(tail), body, conn}
-  end
-
-  defp parse_multipart_file({:more, tail, conn}, limit, opts, upload) do
-    chunk_size = byte_size(tail)
-
-    case apply(upload.adapter.__struct__, :write_part, [
-           upload,
-           tail,
-           chunk_size,
-           false,
-           opts[:adapter_opts]
-         ]) do
-      {:ok, upload} ->
-        Plug.Conn.read_part_body(conn, opts)
-        |> parse_multipart_file(limit - chunk_size, opts, upload)
-
-      {:error, error} ->
-        send_error(conn, error)
+      {:too_large, conn} ->
+        {:too_large, conn}
     end
   end
 
-  # {:ok, tail, conn} means this is the last chunk, so we need to make sure to
-  # finish processing any remainder_bytes
-  defp parse_multipart_file({:ok, tail, conn}, limit, opts, upload)
-       when byte_size(tail) <= limit do
-    chunk_size = byte_size(tail)
+  defp read_scalar({status, chunk, conn}, total, scalar, opts, acc)
+       when status in [:more, :ok] do
+    size = byte_size(chunk)
 
-    # process final chunk
-    case apply(upload.adapter.__struct__, :write_part, [
-           upload,
-           tail,
-           chunk_size,
-           false,
-           opts[:adapter_opts]
-         ]) do
-      {:ok, upload} ->
-        # now write the final non-uniform chunk from remaining bytes
-        process_remainder_bytes(conn, upload, chunk_size, limit, opts)
-
-      {:error, error} ->
-        send_error(conn, error)
-    end
-  end
-
-  defp parse_multipart_file({:ok, tail, conn}, limit, _opts, upload) do
-    {:ok, limit - byte_size(tail), conn, upload}
-  end
-
-  defp process_remainder_bytes(conn, upload, chunk_size, limit, opts) do
-    remainder_bytes = upload.remainder_bytes
-
-    # process final remaining bytes
-    if remainder_bytes == "" do
-      {:ok, limit - chunk_size, conn, upload}
+    if size > total or (is_integer(scalar) and size > scalar) do
+      {:too_large, conn}
     else
-      upload = %{upload | remainder_bytes: ""}
-      chunk_size = byte_size(remainder_bytes)
+      acc = [chunk | acc]
+      total = total - size
+      scalar = if is_integer(scalar), do: scalar - size, else: scalar
 
-      case apply(upload.adapter.__struct__, :write_part, [
-             upload,
-             remainder_bytes,
-             chunk_size,
-             true,
-             opts[:adapter_opts]
-           ]) do
-        {:ok, upload} -> {:ok, limit - chunk_size, conn, upload}
-        {:error, error} -> send_error(conn, error)
+      if status == :ok do
+        {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary(), total, conn}
+      else
+        read_scalar(Plug.Conn.read_part_body(conn, opts), total, scalar, opts, acc)
       end
     end
   end
 
-  defp send_error(conn, error) do
-    error_message = %{
-      error: to_string(error),
-      status: "error"
-    }
+  defp parse_file(name, upload, conn, state, opts) do
+    try do
+      validate_file_field!(name, state.file_count, opts)
+    rescue
+      error ->
+        adapter(upload, :abort, [], opts)
+        reraise error, __STACKTRACE__
+    end
 
-    conn
-    |> put_resp_content_type("application/json")
-    # Note: encode the map to JSON
-    |> send_resp(422, Jason.encode!(error_message))
-    |> halt()
+    upload = prepare_upload(upload, conn, opts)
+    track(upload)
+
+    case read_file(Plug.Conn.read_part_body(conn, opts), state.limit, 0, upload, opts) do
+      {:ok, upload, limit, conn} ->
+        track(upload)
+        index = length(state.uploads)
+
+        {:ok,
+         %{
+           state
+           | limit: limit,
+             file_count: state.file_count + 1,
+             uploads: state.uploads ++ [upload],
+             acc: [{name, {:pending_upload, index}} | state.acc]
+         }, conn}
+
+      {:too_large, conn, upload} ->
+        track(upload)
+        {:too_large, conn}
+    end
   end
 
-  # for a full chunk, when uploading file > 5 mb
+  defp read_file({status, chunk, conn}, total, file_size, upload, opts)
+       when status in [:more, :ok] do
+    size = byte_size(chunk)
+    max_file_size = Keyword.get(opts, :max_file_size, :infinity)
 
-  ## Helpers
+    if size > total or (is_integer(max_file_size) and file_size + size > max_file_size) do
+      {:too_large, conn, upload}
+    else
+      case adapter(upload, :write_part, [chunk, size, status == :ok], opts) do
+        {:ok, upload} ->
+          continue_file(status, conn, total - size, file_size + size, upload, opts)
+
+        %Minne.Upload{} = upload ->
+          continue_file(status, conn, total - size, file_size + size, upload, opts)
+
+        {:error, reason} ->
+          raise "upload adapter write failed: #{inspect(reason)}"
+      end
+    end
+  end
+
+  defp continue_file(:ok, conn, total, _file_size, upload, _opts),
+    do: {:ok, upload, total, conn}
+
+  defp continue_file(:more, conn, total, file_size, upload, opts) do
+    track(upload)
+    read_file(Plug.Conn.read_part_body(conn, opts), total, file_size, upload, opts)
+  end
+
+  defp prepare_upload(upload, conn, opts) do
+    privacy = Map.get(conn.assigns, :privacy, :public)
+
+    upload = %{
+      upload
+      | request_url: conn.request_path,
+        content_encoding: get_header(conn.req_headers, "content-encoding"),
+        private: privacy == :private
+    }
+
+    adapter(upload, :start, [], opts)
+  end
+
+  defp close_uploads(uploads, opts) do
+    Enum.map(uploads, fn upload ->
+      closed = adapter(upload, :close, [], opts)
+      track(closed)
+      closed
+    end)
+  end
+
+  defp replace_uploads(acc, uploads) do
+    Enum.map(acc, fn
+      {name, {:pending_upload, index}} -> {name, Enum.at(uploads, index)}
+      pair -> pair
+    end)
+  end
+
+  defp validate_terminal!(state, opts) do
+    case Keyword.fetch(opts, :required_file_count) do
+      {:ok, count} when state.file_count != count -> raise "invalid multipart file count"
+      _ -> :ok
+    end
+  end
+
+  defp validate_file_field!(name, count, opts) do
+    if fields = Keyword.get(opts, :allowed_file_fields) do
+      unless name in fields, do: raise("unexpected multipart file field")
+    end
+
+    if required = Keyword.get(opts, :required_file_count) do
+      if count >= required, do: raise("too many multipart file parts")
+    end
+  end
+
+  defp scalar_limit!(name, opts) do
+    case Keyword.fetch(opts, :allowed_scalar_fields) do
+      :error ->
+        :infinity
+
+      {:ok, fields} ->
+        fields =
+          if Keyword.keyword?(fields),
+            do: Map.new(fields, fn {k, v} -> {to_string(k), v} end),
+            else: fields
+
+        case Map.fetch(fields, name) do
+          {:ok, limit} -> limit
+          :error -> raise "unexpected multipart scalar field"
+        end
+    end
+  end
+
+  defp policy?(opts) do
+    Enum.any?(
+      [:allowed_file_fields, :allowed_scalar_fields, :required_file_count],
+      &Keyword.has_key?(opts, &1)
+    )
+  end
+
+  defp scalar_read_opts(opts, :infinity), do: opts
+
+  defp scalar_read_opts(opts, limit) when is_integer(limit) and limit >= 0 do
+    read_size = limit + 1
+
+    opts
+    |> Keyword.put(:length, read_size)
+    |> Keyword.put(:read_length, read_size)
+  end
+
+  defp track(upload) do
+    uploads = Process.get(@tracker, [])
+    module = upload.adapter.__struct__
+
+    Process.put(@tracker, [
+      {module, upload} | Enum.reject(uploads, fn {_, old} -> same_upload?(old, upload) end)
+    ])
+  end
+
+  defp same_upload?(left, right) do
+    left.adapter.__struct__ == right.adapter.__struct__ and
+      Map.get(left.adapter, :path) == Map.get(right.adapter, :path) and
+      Map.get(left.adapter, :key) == Map.get(right.adapter, :key)
+  end
+
+  defp abort_tracked({_limit, _headers, opts}), do: abort_tracked(opts)
+
+  defp abort_tracked(opts) do
+    Enum.each(Process.get(@tracker, []), fn {module, upload} ->
+      try do
+        apply(module, :abort, [upload, opts[:adapter_opts]])
+      rescue
+        error -> Logger.error("Minne adapter abort failed: #{Exception.message(error)}")
+      end
+    end)
+  end
+
+  defp adapter(upload, fun, args, opts) do
+    apply(upload.adapter.__struct__, fun, [upload | args] ++ [opts[:adapter_opts]])
+  end
 
   defp multipart_type(headers, opts) do
     if disposition = get_header(headers, "content-disposition") do
       multipart_type_from_disposition(headers, disposition, opts)
     else
-      multipart_type_from_unnamed(opts)
-    end
-  end
-
-  defp multipart_type_from_unnamed(opts) do
-    case Keyword.fetch(opts, :include_unnamed_parts_at) do
-      {:ok, name} when is_binary(name) -> {:part, name <> "[]"}
-      :error -> :skip
+      case Keyword.fetch(opts, :include_unnamed_parts_at) do
+        {:ok, name} when is_binary(name) -> {:part, name <> "[]"}
+        :error -> :skip
+      end
     end
   end
 
   defp multipart_type_from_disposition(headers, disposition, opts) do
     with [_, params] <- :binary.split(disposition, ";"),
          %{"name" => name} = params <- Plug.Conn.Utils.params(params) do
-      handle_disposition(params, name, headers, opts)
+      case params do
+        %{"filename" => ""} ->
+          {:empty_file, name}
+
+        %{"filename" => filename} ->
+          {:file, name, create_upload(filename, headers, opts)}
+
+        %{"filename*" => ""} ->
+          {:empty_file, name}
+
+        %{"filename*" => "utf-8''" <> filename} ->
+          filename = URI.decode(filename)
+
+          Plug.Conn.Utils.validate_utf8!(
+            filename,
+            Plug.Parsers.BadEncodingError,
+            "multipart filename"
+          )
+
+          {:file, name, create_upload(filename, headers, opts)}
+
+        %{} ->
+          {:binary, name}
+      end
     else
       _ -> :skip
     end
   end
 
-  defp handle_disposition(params, name, headers, opts) do
-    case params do
-      %{"filename" => ""} ->
-        :skip
-
-      %{"filename" => filename} ->
-        content_type = get_header(headers, "content-type")
-        # alternative to plug upload struct
-        {:file, name, create_new_upload(filename, content_type, opts)}
-
-      %{"filename*" => ""} ->
-        :skip
-
-      %{"filename*" => "utf-8''" <> filename} ->
-        filename = URI.decode(filename)
-
-        Plug.Conn.Utils.validate_utf8!(
-          filename,
-          Plug.Parsers.BadEncodingError,
-          "multipart filename"
-        )
-
-        content_type = get_header(headers, "content-type")
-
-        {:file, name, create_new_upload(filename, content_type, opts)}
-
-      %{} ->
-        {:binary, name}
-    end
-  end
-
-  defp create_new_upload(filename, content_type, opts) do
-    # grab adapter from options, convert to struct, and create new upload struct
-    ms =
-      Keyword.get(opts, :adapter, Minne.Adapter.Temp)
+  defp create_upload(filename, headers, opts) do
+    upload =
+      opts
+      |> Keyword.get(:adapter, Minne.Adapter.Temp)
       |> struct()
       |> Minne.Upload.new()
-      |> Map.merge(%{
-        filename: filename,
-        content_type: content_type
-      })
+      |> Map.merge(%{filename: filename, content_type: get_header(headers, "content-type")})
 
-    apply(ms.adapter.__struct__, :init, [ms, opts[:adapter_opts]])
+    adapter(upload, :init, [], opts)
   end
 
   def get_header(headers, key) do

@@ -17,4 +17,5 @@ defmodule Minne.Adapter do
             ) ::
               Upload.t() | {:error, any()}
   @callback close(Upload.t(), opts) :: Upload.t()
+  @callback abort(Upload.t(), opts) :: :ok
 end

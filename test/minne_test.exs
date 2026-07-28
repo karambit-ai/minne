@@ -166,7 +166,12 @@ defmodule MinneTest do
       end
     end
 
-    opts = Plug.Parsers.init(parsers: [{:multipart, length: {LengthGetter, :get, []}}])
+    opts =
+      Plug.Parsers.init(
+        parsers: [
+          {Minne, adapter: Minne.Adapter.Temp, length: {LengthGetter, :get, []}}
+        ]
+      )
 
     assert_raise Plug.Parsers.RequestTooLargeError, fn ->
       conn(:post, "/", multipart)
@@ -265,5 +270,82 @@ defmodule MinneTest do
       |> parse()
 
     assert params == %{}
+  end
+
+  describe "restricted multipart policy" do
+    test "accepts one configured file and a small configured scalar" do
+      conn = restricted_parse([{"digest", nil, "abc"}, {"file", "a.bin", "payload"}])
+      assert conn.params["digest"] == "abc"
+      assert %Minne.Upload{size: 7} = conn.params["file"]
+    end
+
+    test "rejects an over-limit scalar before accepting the form" do
+      assert_raise Plug.Parsers.RequestTooLargeError, fn ->
+        restricted_parse([{"digest", nil, String.duplicate("x", 20)}, {"file", "a", "ok"}])
+      end
+    end
+
+    test "rejects an unexpected scalar" do
+      assert_raise Plug.Parsers.ParseError, fn ->
+        restricted_parse([{"other", nil, "x"}, {"file", "a", "ok"}])
+      end
+    end
+
+    test "rejects configured file field without a filename" do
+      assert_raise Plug.Parsers.ParseError, fn ->
+        restricted_parse([{"file", "", ""}])
+      end
+    end
+
+    test "rejects an extra file part" do
+      before = multipart_temp_files()
+
+      assert_raise Plug.Parsers.ParseError, fn ->
+        restricted_parse([{"file", "a", "one"}, {"file", "b", "two"}])
+      end
+
+      assert multipart_temp_files() == before
+    end
+
+    test "rejects an unexpected file field" do
+      assert_raise Plug.Parsers.ParseError, fn ->
+        restricted_parse([{"other_file", "a", "one"}])
+      end
+    end
+
+    test "rejects a missing required file" do
+      assert_raise Plug.Parsers.ParseError, fn ->
+        restricted_parse([{"digest", nil, "abc"}])
+      end
+    end
+  end
+
+  defp restricted_parse(parts) do
+    boundary = "minne-policy"
+
+    body =
+      Enum.map_join(parts, "", fn {name, filename, value} ->
+        filename = if is_nil(filename), do: "", else: "; filename=\"#{filename}\""
+
+        "--#{boundary}\r\nContent-Disposition: form-data; name=\"#{name}\"#{filename}\r\n\r\n#{value}\r\n"
+      end) <> "--#{boundary}--\r\n"
+
+    conn(:post, "/", body)
+    |> put_req_header("content-type", "multipart/form-data; boundary=#{boundary}")
+    |> parse(
+      length: 1_000,
+      read_length: 8,
+      allowed_file_fields: ["file"],
+      allowed_scalar_fields: %{"digest" => 8},
+      required_file_count: 1,
+      max_file_size: 100
+    )
+  end
+
+  defp multipart_temp_files do
+    System.tmp_dir!()
+    |> Path.join("**/*multipart*")
+    |> Path.wildcard()
+    |> MapSet.new()
   end
 end

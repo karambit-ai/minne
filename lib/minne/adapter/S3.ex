@@ -1,45 +1,85 @@
 defmodule Minne.Adapter.S3 do
+  @moduledoc """
+  Streams multipart form files to an S3-compatible object store.
+
+  Multipart uploads retain at most `max_in_flight_parts * part_size` bytes in
+  S3 upload tasks per request. Once the configured window is full, parsing
+  waits for the oldest part and therefore applies backpressure to the inbound
+  request.
+  """
+
   require Logger
   @behaviour Minne.Adapter
 
-  @min_chunk Application.compile_env(:minne, :chunk_size) || 5_242_880
+  @min_part_size 5_242_880
+  @max_part_size 5_368_709_120
+  @default_max_parts 10_000
+  @default_max_in_flight_parts 4
+  @default_part_timeout 300_000
+  @default_complete_timeout 300_000
+  @default_abort_timeout 30_000
 
   defstruct key: "",
             bucket: "",
             parts: [],
+            in_flight_parts: [],
             parts_count: 0,
             upload_id: nil,
             hashes: %{},
             max_file_size: 0,
+            part_size: @min_part_size,
+            max_parts: @default_max_parts,
+            max_in_flight_parts: @default_max_in_flight_parts,
+            part_timeout: @default_part_timeout,
+            complete_timeout: @default_complete_timeout,
+            abort_timeout: @default_abort_timeout,
             path_function: nil,
             bucket_function: nil,
             private: nil
 
   @impl Minne.Adapter
-  def default_opts, do: [length: 16_000_000_000, read_length: @min_chunk]
+  def default_opts, do: [length: 16_000_000_000, read_length: @min_part_size]
 
   @impl Minne.Adapter
   def init(upload, opts) do
-    case {opts[:bucket_function], opts[:path_function], opts[:max_file_size]} do
-      {nil, _, _} ->
-        {:error, "bucket_function is required to use minne's s3 adapter"}
+    part_size = Keyword.get(opts, :part_size, @min_part_size)
+    max_parts = Keyword.get(opts, :max_parts, @default_max_parts)
+    max_in_flight_parts = Keyword.get(opts, :max_in_flight_parts, @default_max_in_flight_parts)
+    part_timeout = Keyword.get(opts, :part_timeout, @default_part_timeout)
+    complete_timeout = Keyword.get(opts, :complete_timeout, @default_complete_timeout)
+    abort_timeout = Keyword.get(opts, :abort_timeout, @default_abort_timeout)
 
-      {_, nil, _} ->
-        {:error, "path_function is required to use minne's s3 adapter"}
+    with {:ok, bucket_function} <- required_function(opts, :bucket_function),
+         {:ok, path_function} <- required_function(opts, :path_function),
+         {:ok, max_file_size} <- positive_integer(opts, :max_file_size),
+         :ok <- integer_between(part_size, @min_part_size, @max_part_size, :part_size),
+         :ok <- integer_between(max_parts, 1, @default_max_parts, :max_parts),
+         :ok <-
+           integer_between(
+             max_in_flight_parts,
+             1,
+             max_parts,
+             :max_in_flight_parts
+           ),
+         :ok <- positive(part_timeout, :part_timeout),
+         :ok <- positive(complete_timeout, :complete_timeout),
+         :ok <- positive(abort_timeout, :abort_timeout),
+         :ok <- validate_part_budget(max_file_size, part_size, max_parts) do
+      adapter = %{
+        upload.adapter
+        | bucket_function: bucket_function,
+          path_function: path_function,
+          max_file_size: max_file_size,
+          part_size: part_size,
+          max_parts: max_parts,
+          max_in_flight_parts: max_in_flight_parts,
+          part_timeout: part_timeout,
+          complete_timeout: complete_timeout,
+          abort_timeout: abort_timeout,
+          hashes: new_hashes()
+      }
 
-      {_, _, nil} ->
-        {:error, "max_file_size is required to use minne's s3 adapter"}
-
-      {bucket_function, path_function, max_file_size} ->
-        adapter = %{
-          upload.adapter
-          | bucket_function: bucket_function,
-            path_function: path_function,
-            max_file_size: max_file_size,
-            hashes: new_hashes()
-        }
-
-        %{upload | adapter: adapter}
+      %{upload | adapter: adapter}
     end
   end
 
@@ -64,7 +104,14 @@ defmodule Minne.Adapter.S3 do
           adapter: update_hashes(upload.adapter, chunk)
       }
 
-      {:ok, flush_full_parts(upload)}
+      case flush_full_parts(upload) do
+        {:ok, upload} ->
+          {:ok, upload}
+
+        {:error, reason, upload} ->
+          abort(upload, [])
+          {:error, reason}
+      end
     end
   end
 
@@ -81,16 +128,32 @@ defmodule Minne.Adapter.S3 do
   end
 
   def close(upload, _opts) do
-    upload = flush_remainder(upload)
+    upload =
+      case flush_remainder(upload) do
+        {:ok, upload} ->
+          upload
+
+        {:error, reason, upload} ->
+          abort(upload, [])
+          raise "multipart upload failed: #{inspect(reason)}"
+      end
+
+    upload = drain_all(upload)
 
     try do
-      parts = upload.adapter.parts |> Enum.map(&await_part/1) |> Enum.reverse()
+      parts = Enum.reverse(upload.adapter.parts)
 
-      client().complete_multipart_upload(
-        upload.adapter.bucket,
-        upload.adapter.key,
-        upload.adapter.upload_id,
-        parts
+      run_operation(
+        fn ->
+          client().complete_multipart_upload(
+            upload.adapter.bucket,
+            upload.adapter.key,
+            upload.adapter.upload_id,
+            parts
+          )
+        end,
+        upload.adapter.complete_timeout,
+        "multipart completion timed out"
       )
 
       adapter = upload.adapter |> Map.put(:parts, parts) |> finalize_hashes()
@@ -110,15 +173,20 @@ defmodule Minne.Adapter.S3 do
   def abort(%{adapter: %{upload_id: nil}}, _opts), do: :ok
 
   def abort(upload, _opts) do
-    Enum.each(upload.adapter.parts, fn
-      %Task{} = task -> Task.shutdown(task, :brutal_kill)
-      _completed_part -> :ok
+    Enum.each(upload.adapter.in_flight_parts, fn entry ->
+      Task.shutdown(entry.task, :brutal_kill)
     end)
 
-    client().abort_multipart_upload(
-      upload.adapter.bucket,
-      upload.adapter.key,
-      upload.adapter.upload_id
+    run_operation(
+      fn ->
+        client().abort_multipart_upload(
+          upload.adapter.bucket,
+          upload.adapter.key,
+          upload.adapter.upload_id
+        )
+      end,
+      upload.adapter.abort_timeout,
+      "multipart abort timed out"
     )
 
     :ok
@@ -132,16 +200,21 @@ defmodule Minne.Adapter.S3 do
       :ok
   end
 
-  defp flush_full_parts(upload) when byte_size(upload.remainder_bytes) < @min_chunk, do: upload
+  defp flush_full_parts(upload)
+       when byte_size(upload.remainder_bytes) < upload.adapter.part_size,
+       do: {:ok, upload}
 
   defp flush_full_parts(upload) do
-    upload = ensure_upload_id(upload)
-    <<chunk::binary-size(@min_chunk), remainder::binary>> = upload.remainder_bytes
-    upload = enqueue_part(%{upload | remainder_bytes: remainder}, chunk)
-    flush_full_parts(upload)
+    part_size = upload.adapter.part_size
+    <<chunk::binary-size(^part_size), remainder::binary>> = upload.remainder_bytes
+
+    case enqueue_part(%{upload | remainder_bytes: remainder}, chunk) do
+      {:ok, upload} -> flush_full_parts(upload)
+      {:error, reason, upload} -> {:error, reason, upload}
+    end
   end
 
-  defp flush_remainder(%{remainder_bytes: ""} = upload), do: upload
+  defp flush_remainder(%{remainder_bytes: ""} = upload), do: {:ok, upload}
 
   defp flush_remainder(upload) do
     chunk = upload.remainder_bytes
@@ -158,38 +231,159 @@ defmodule Minne.Adapter.S3 do
   defp ensure_upload_id(upload), do: upload
 
   defp enqueue_part(upload, chunk) do
+    upload = ensure_upload_id(upload)
     count = upload.adapter.parts_count + 1
-    task = upload_async(upload, count, chunk)
-    adapter = %{upload.adapter | parts_count: count, parts: [task | upload.adapter.parts]}
-    %{upload | adapter: adapter}
+
+    if count > upload.adapter.max_parts do
+      {:error, :too_many_parts, upload}
+    else
+      entry = upload_async(upload, count, chunk)
+
+      adapter = %{
+        upload.adapter
+        | parts_count: count,
+          in_flight_parts: upload.adapter.in_flight_parts ++ [entry]
+      }
+
+      upload = %{upload | adapter: adapter}
+
+      if length(adapter.in_flight_parts) >= adapter.max_in_flight_parts,
+        do: {:ok, drain_one(upload)},
+        else: {:ok, upload}
+    end
   end
 
   defp upload_async(upload, number, chunk) do
-    Task.async(fn ->
-      try do
-        %{headers: headers} =
-          client().upload_part(
-            upload.adapter.bucket,
-            upload.adapter.key,
-            upload.adapter.upload_id,
-            number,
-            chunk
-          )
+    started_at = System.monotonic_time(:millisecond)
 
-        {:ok, {number, Minne.get_header(headers, "ETag")}}
-      rescue
-        error -> {:error, :error, error, __STACKTRACE__}
-      catch
-        kind, reason -> {:error, kind, reason, __STACKTRACE__}
-      end
-    end)
+    task =
+      Task.async(fn ->
+        try do
+          %{headers: headers} =
+            client().upload_part(
+              upload.adapter.bucket,
+              upload.adapter.key,
+              upload.adapter.upload_id,
+              number,
+              chunk
+            )
+
+          {:ok, {number, Minne.get_header(headers, "ETag")}, System.monotonic_time(:millisecond)}
+        rescue
+          error -> {:error, :error, error, __STACKTRACE__}
+        catch
+          kind, reason -> {:error, kind, reason, __STACKTRACE__}
+        end
+      end)
+
+    %{task: task, started_at: started_at}
   end
 
-  defp await_part(task) do
-    case Task.await(task, 10_000) do
-      {:ok, part} -> part
-      {:error, kind, reason, stacktrace} -> :erlang.raise(kind, reason, stacktrace)
+  defp drain_all(%{adapter: %{in_flight_parts: []}} = upload), do: upload
+  defp drain_all(upload), do: upload |> drain_one() |> drain_all()
+
+  defp drain_one(upload) do
+    [entry | remaining] = upload.adapter.in_flight_parts
+    upload = put_in(upload.adapter.in_flight_parts, remaining)
+
+    try do
+      part = await_part(entry, upload.adapter.part_timeout)
+      update_in(upload.adapter.parts, &[part | &1])
+    rescue
+      error ->
+        abort(upload, [])
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        abort(upload, [])
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
+  end
+
+  defp await_part(entry, timeout) do
+    elapsed = System.monotonic_time(:millisecond) - entry.started_at
+    remaining = max(timeout - elapsed, 0)
+
+    case Task.yield(entry.task, remaining) do
+      {:ok, {:ok, part, completed_at}} ->
+        if completed_at - entry.started_at <= timeout,
+          do: part,
+          else: raise_part_timeout(entry.task)
+
+      {:ok, {:error, kind, reason, stacktrace}} ->
+        :erlang.raise(kind, reason, stacktrace)
+
+      {:exit, reason} ->
+        exit(reason)
+
+      nil ->
+        raise_part_timeout(entry.task)
+    end
+  end
+
+  defp raise_part_timeout(task) do
+    Task.shutdown(task, :brutal_kill)
+    raise "multipart part upload timed out"
+  end
+
+  defp run_operation(function, timeout, timeout_message) do
+    task =
+      Task.async(fn ->
+        try do
+          {:ok, function.()}
+        rescue
+          error -> {:error, :error, error, __STACKTRACE__}
+        catch
+          kind, reason -> {:error, kind, reason, __STACKTRACE__}
+        end
+      end)
+
+    case Task.yield(task, timeout) do
+      {:ok, {:ok, result}} ->
+        result
+
+      {:ok, {:error, kind, reason, stacktrace}} ->
+        :erlang.raise(kind, reason, stacktrace)
+
+      {:exit, reason} ->
+        exit(reason)
+
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+        raise timeout_message
+    end
+  end
+
+  defp required_function(opts, key) do
+    case Keyword.get(opts, key) do
+      function when is_function(function, 1) -> {:ok, function}
+      _other -> {:error, "#{key} is required to use minne's s3 adapter"}
+    end
+  end
+
+  defp positive_integer(opts, key) do
+    case Keyword.get(opts, key) do
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _other -> {:error, "#{key} must be a positive integer"}
+    end
+  end
+
+  defp integer_between(value, minimum, maximum, _key)
+       when is_integer(value) and value >= minimum and value <= maximum,
+       do: :ok
+
+  defp integer_between(_value, minimum, maximum, key),
+    do: {:error, "#{key} must be an integer between #{minimum} and #{maximum}"}
+
+  defp positive(value, _key) when is_integer(value) and value > 0, do: :ok
+  defp positive(_value, key), do: {:error, "#{key} must be a positive integer"}
+
+  defp validate_part_budget(max_file_size, part_size, max_parts) do
+    required_parts = div(max_file_size + part_size - 1, part_size)
+
+    if required_parts <= max_parts,
+      do: :ok,
+      else: {:error, "max_file_size requires more than #{max_parts} multipart parts"}
   end
 
   defp new_hashes do

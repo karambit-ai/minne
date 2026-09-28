@@ -1,4 +1,8 @@
 defmodule Minne.Adapter.Temp do
+  @moduledoc """
+  Streams multipart uploads to temporary files on the local filesystem.
+  """
+
   @behaviour Minne.Adapter
   @default_length 1_000_000
 
@@ -11,7 +15,7 @@ defmodule Minne.Adapter.Temp do
             file: nil
 
   @impl Minne.Adapter
-  def default_opts() do
+  def default_opts do
     [length: 8_000_000, read_length: @default_length]
   end
 

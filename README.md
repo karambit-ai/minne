@@ -63,8 +63,9 @@ The S3 adapter options are:
 - `max_parts` — maximum parts accepted before aborting; defaults to 10,000 and
   cannot exceed 10,000.
 - `max_in_flight_parts` — bounded concurrent part uploads; defaults to 4.
-- `part_timeout` — maximum milliseconds to wait for a part; defaults to five
-  minutes.
+- `part_timeout` — deadline for each S3 part operation in milliseconds;
+  defaults to five minutes and is enforced independently of inbound request
+  progress.
 - `complete_timeout` — multipart completion deadline in milliseconds; defaults
   to five minutes.
 - `abort_timeout` — best-effort multipart abort deadline in milliseconds;
@@ -80,6 +81,12 @@ Memory used by active part uploads is bounded primarily by
 `part_size * max_in_flight_parts` per request, plus parser and HTTP-client
 overhead. Choose both values with expected concurrent requests and S3 connection
 limits in mind.
+
+At the end of each multipart form file, Minne uploads its final short part and
+drains that file's in-flight window. The S3 multipart upload remains incomplete
+until every request field passes terminal validation. This bounds concurrency
+across multi-file requests without publishing an object that a later invalid
+field should reject.
 
 ### Temp
 

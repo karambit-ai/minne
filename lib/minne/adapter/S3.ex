@@ -92,7 +92,7 @@ defmodule Minne.Adapter.S3 do
   end
 
   @impl Minne.Adapter
-  def write_part(upload, chunk, size, _final?, _opts) do
+  def write_part(upload, chunk, size, final?, _opts) do
     if upload.size + size > upload.adapter.max_file_size do
       abort(upload, [])
       {:error, :too_large}
@@ -106,12 +106,25 @@ defmodule Minne.Adapter.S3 do
 
       case flush_full_parts(upload) do
         {:ok, upload} ->
-          {:ok, upload}
+          finish_write(upload, final?)
 
         {:error, reason, upload} ->
           abort(upload, [])
           {:error, reason}
       end
+    end
+  end
+
+  defp finish_write(upload, false), do: {:ok, upload}
+
+  defp finish_write(upload, true) do
+    case flush_remainder(upload) do
+      {:ok, upload} ->
+        {:ok, drain_all(upload)}
+
+      {:error, reason, upload} ->
+        abort(upload, [])
+        {:error, reason}
     end
   end
 
@@ -254,21 +267,25 @@ defmodule Minne.Adapter.S3 do
   end
 
   defp upload_async(upload, number, chunk) do
-    started_at = System.monotonic_time(:millisecond)
-
     task =
       Task.async(fn ->
         try do
           %{headers: headers} =
-            client().upload_part(
-              upload.adapter.bucket,
-              upload.adapter.key,
-              upload.adapter.upload_id,
-              number,
-              chunk
+            run_operation(
+              fn ->
+                client().upload_part(
+                  upload.adapter.bucket,
+                  upload.adapter.key,
+                  upload.adapter.upload_id,
+                  number,
+                  chunk
+                )
+              end,
+              upload.adapter.part_timeout,
+              "multipart part upload timed out"
             )
 
-          {:ok, {number, Minne.get_header(headers, "ETag")}, System.monotonic_time(:millisecond)}
+          {:ok, {number, Minne.get_header(headers, "ETag")}}
         rescue
           error -> {:error, :error, error, __STACKTRACE__}
         catch
@@ -276,7 +293,7 @@ defmodule Minne.Adapter.S3 do
         end
       end)
 
-    %{task: task, started_at: started_at}
+    %{task: task}
   end
 
   defp drain_all(%{adapter: %{in_flight_parts: []}} = upload), do: upload
@@ -287,7 +304,7 @@ defmodule Minne.Adapter.S3 do
     upload = put_in(upload.adapter.in_flight_parts, remaining)
 
     try do
-      part = await_part(entry, upload.adapter.part_timeout)
+      part = await_part(entry.task, upload.adapter.part_timeout)
       update_in(upload.adapter.parts, &[part | &1])
     rescue
       error ->
@@ -300,15 +317,10 @@ defmodule Minne.Adapter.S3 do
     end
   end
 
-  defp await_part(entry, timeout) do
-    elapsed = System.monotonic_time(:millisecond) - entry.started_at
-    remaining = max(timeout - elapsed, 0)
-
-    case Task.yield(entry.task, remaining) do
-      {:ok, {:ok, part, completed_at}} ->
-        if completed_at - entry.started_at <= timeout,
-          do: part,
-          else: raise_part_timeout(entry.task)
+  defp await_part(task, timeout) do
+    case Task.yield(task, timeout + 1_000) do
+      {:ok, {:ok, part}} ->
+        part
 
       {:ok, {:error, kind, reason, stacktrace}} ->
         :erlang.raise(kind, reason, stacktrace)
@@ -317,7 +329,7 @@ defmodule Minne.Adapter.S3 do
         exit(reason)
 
       nil ->
-        raise_part_timeout(entry.task)
+        raise_part_timeout(task)
     end
   end
 

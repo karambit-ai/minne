@@ -26,6 +26,8 @@ defmodule Minne.TestS3Client do
   end
 
   def upload_part(_bucket, _key, _upload_id, part_number, _chunk) do
+    part_pid = self()
+
     Agent.update(__MODULE__, fn state ->
       active = state.active_parts + 1
 
@@ -33,6 +35,7 @@ defmodule Minne.TestS3Client do
         state
         | active_parts: active,
           max_active_parts: max(active, state.max_active_parts),
+          part_pids: [part_pid | state.part_pids],
           uploaded_parts: [part_number | state.uploaded_parts]
       }
     end)
@@ -72,6 +75,7 @@ defmodule Minne.TestS3Client do
       initiate_count: 0,
       max_active_parts: 0,
       part_delay: Keyword.get(opts, :part_delay, 0),
+      part_pids: [],
       put_bodies: [],
       uploaded_parts: []
     }
@@ -80,6 +84,9 @@ end
 
 defmodule Minne.Adapter.S3Test do
   use ExUnit.Case, async: false
+
+  import Plug.Conn
+  import Plug.Test
 
   alias Minne.Adapter.S3
 
@@ -177,12 +184,96 @@ defmodule Minne.Adapter.S3Test do
     assert upload.adapter.parts_count == 3
   end
 
+  test "bounds part concurrency across every file in one multipart request" do
+    Minne.TestS3Client.reset([], part_delay: 100)
+    boundary = "minne-multiple-s3-files"
+    bytes = String.duplicate("x", @chunk_size)
+
+    body = multipart_files(boundary, fn index -> {"file#{index}", "#{index}.bin", bytes} end, 3)
+
+    parser =
+      Plug.Parsers.init(
+        parsers: [
+          {Minne,
+           length: byte_size(body),
+           read_length: 1_048_576,
+           adapter: S3,
+           adapter_opts:
+             Keyword.merge(options(),
+               max_file_size: @chunk_size,
+               max_in_flight_parts: 2,
+               path_function: fn upload -> {upload.filename, false} end
+             )}
+        ]
+      )
+
+    conn =
+      conn(:post, "/", body)
+      |> put_req_header("content-type", "multipart/form-data; boundary=#{boundary}")
+      |> Plug.Parsers.call(parser)
+
+    assert %Minne.Upload{} = conn.params["file1"]
+    assert %Minne.Upload{} = conn.params["file2"]
+    assert %Minne.Upload{} = conn.params["file3"]
+    assert Minne.TestS3Client.state().max_active_parts <= 2
+    assert Minne.TestS3Client.state().complete_count == 3
+  end
+
+  test "does not publish staged files when terminal multipart validation fails" do
+    boundary = "minne-rejected-s3-files"
+
+    body = multipart_files(boundary, fn index -> {"file", "#{index}.bin", "file #{index}"} end, 2)
+
+    parser =
+      Plug.Parsers.init(
+        parsers: [
+          {Minne,
+           length: byte_size(body),
+           read_length: 8,
+           allowed_file_fields: ["file"],
+           required_file_count: 1,
+           max_file_size: @chunk_size,
+           adapter: S3,
+           adapter_opts:
+             Keyword.merge(options(),
+               max_file_size: @chunk_size,
+               path_function: fn upload -> {upload.filename, false} end
+             )}
+        ]
+      )
+
+    assert_raise Plug.Parsers.ParseError, fn ->
+      conn(:post, "/", body)
+      |> put_req_header("content-type", "multipart/form-data; boundary=#{boundary}")
+      |> Plug.Parsers.call(parser)
+    end
+
+    assert Minne.TestS3Client.state().complete_count == 0
+    assert Minne.TestS3Client.state().abort_count == 1
+  end
+
   test "times out a slow part and aborts its multipart upload" do
     Minne.TestS3Client.reset([], part_delay: 50)
     bytes = String.duplicate("x", @chunk_size)
     upload = new_upload(max_in_flight_parts: 1, part_timeout: 1)
 
     assert_raise RuntimeError, "multipart part upload timed out", fn -> write(upload, bytes) end
+    assert Minne.TestS3Client.state().abort_count == 1
+  end
+
+  test "stops a timed-out part below the concurrency window without another write" do
+    Minne.TestS3Client.reset([], part_delay: 5_000)
+    bytes = String.duplicate("x", @chunk_size)
+
+    upload =
+      new_upload(max_in_flight_parts: 4, part_timeout: 10)
+      |> write(bytes)
+
+    assert_eventually(fn -> Minne.TestS3Client.state().part_pids != [] end)
+    [part_pid] = Minne.TestS3Client.state().part_pids
+    assert_eventually(fn -> not Process.alive?(part_pid) end)
+
+    assert_raise RuntimeError, "multipart part upload timed out", fn -> S3.close(upload, []) end
     assert Minne.TestS3Client.state().abort_count == 1
   end
 
@@ -250,9 +341,33 @@ defmodule Minne.Adapter.S3Test do
     S3.start(upload, Keyword.merge(options(), overrides))
   end
 
-  defp write(upload, bytes) do
-    assert {:ok, upload} = S3.write_part(upload, bytes, byte_size(bytes), false, options())
+  defp write(upload, bytes, final? \\ false) do
+    assert {:ok, upload} = S3.write_part(upload, bytes, byte_size(bytes), final?, options())
     upload
+  end
+
+  defp assert_eventually(condition, attempts \\ 100)
+
+  defp assert_eventually(condition, attempts) when attempts > 0 do
+    if condition.() do
+      :ok
+    else
+      Process.sleep(5)
+      assert_eventually(condition, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_condition, 0), do: flunk("condition did not become true")
+
+  defp multipart_files(boundary, file, count) do
+    Enum.map_join(1..count, "", fn index ->
+      {name, filename, bytes} = file.(index)
+
+      "--#{boundary}\r\n" <>
+        ~s|Content-Disposition: form-data; name="#{name}"; filename="#{filename}"\r\n| <>
+        "Content-Type: application/octet-stream\r\n\r\n" <>
+        bytes <> "\r\n"
+    end) <> "--#{boundary}--\r\n"
   end
 
   defp options do

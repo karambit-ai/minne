@@ -5,7 +5,7 @@ defmodule Minne.MixProject do
     [
       app: :minne,
       version: "0.1.1",
-      elixir: "~> 1.14",
+      elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps()
     ]
@@ -21,11 +21,11 @@ defmodule Minne.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:plug, "~> 1.17"},
-      {:ex_aws, "~> 2.2", optional: true},
+      {:plug, "~> 1.20"},
+      {:ex_aws, "~> 2.7", optional: true},
       {:ex_aws_s3, "~> 2.5", optional: true},
-      {:hackney, "~> 1.23", optional: true},
-      {:sweet_xml, "~> 0.6.6", optional: true},
+      {:hackney, "~> 4.8", optional: true},
+      {:sweet_xml, "~> 0.7.5", optional: true},
 
       ### UUID generation
       {:elixir_uuid, "~> 1.2"},

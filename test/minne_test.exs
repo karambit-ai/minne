@@ -5,7 +5,8 @@ defmodule MinneTest do
   # doctest Minne
   use ExUnit.Case, async: true
 
-  use Plug.Test
+  import Plug.Conn
+  import Plug.Test
 
   def parse(conn, opts \\ []) do
     opts =
@@ -161,7 +162,7 @@ defmodule MinneTest do
     {:ok, _agent} = Agent.start_link(fn -> 0 end, name: :multipart_length)
 
     defmodule LengthGetter do
-      def get() do
+      def get do
         Agent.get(:multipart_length, & &1)
       end
     end
@@ -227,7 +228,7 @@ defmodule MinneTest do
   end
 
   test "validates utf8 in multipart body" do
-    latin1_binary = :unicode.characters_to_binary('hello©', :utf8, :latin1)
+    latin1_binary = :unicode.characters_to_binary("hello©", :utf8, :latin1)
 
     multipart = """
     ------w58EW1cEpjzydSCq\r
@@ -245,7 +246,7 @@ defmodule MinneTest do
   end
 
   test "does not validate utf8 in multipart body opt" do
-    latin1_binary = :unicode.characters_to_binary('hello©', :utf8, :latin1)
+    latin1_binary = :unicode.characters_to_binary("hello©", :utf8, :latin1)
 
     multipart = """
     ------w58EW1cEpjzydSCq\r

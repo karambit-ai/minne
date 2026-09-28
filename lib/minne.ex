@@ -13,13 +13,16 @@ defmodule Minne do
   require Logger
 
   alias __MODULE__
+  alias Plug.Conn.{Query, Utils}
+  alias Plug.Parsers.{BadEncodingError, ParseError}
+  alias Plug.UploadError
 
   @tracker {__MODULE__, :uploads}
 
   @impl Plug.Parsers
   def init(opts) do
     adapter = Keyword.get(opts, :adapter) || raise "Must supply adapter in options"
-    defaults = apply(adapter, :default_opts, [])
+    defaults = adapter.default_opts()
     {limit, opts} = Keyword.pop(opts, :length, defaults[:length])
     {read_length, opts} = Keyword.pop(opts, :read_length, defaults[:read_length])
     {headers_opts, opts} = Keyword.pop(opts, :headers, [])
@@ -41,7 +44,7 @@ defmodule Minne do
 
       result
     rescue
-      e in [Plug.UploadError, Plug.Parsers.BadEncodingError] ->
+      e in [UploadError, BadEncodingError] ->
         abort_tracked(opts)
         Logger.error("Minne: #{inspect(e)}")
         reraise e, __STACKTRACE__
@@ -49,7 +52,7 @@ defmodule Minne do
       e ->
         abort_tracked(opts)
         Logger.error("Minne multipart parse failed: #{Exception.message(e)}")
-        reraise Plug.Parsers.ParseError.exception(exception: e), __STACKTRACE__
+        reraise ParseError.exception(exception: e), __STACKTRACE__
     catch
       kind, reason ->
         abort_tracked(opts)
@@ -73,7 +76,11 @@ defmodule Minne do
         validate_terminal!(state, opts)
         uploads = close_uploads(state.uploads, opts)
         acc = replace_uploads(state.acc, uploads)
-        {:ok, Enum.reduce(acc, %{}, &Plug.Conn.Query.decode_pair/2), conn}
+
+        params =
+          acc |> List.foldr(Query.decode_init(), &Query.decode_each/2) |> Query.decode_done()
+
+        {:ok, params, conn}
 
       {:too_large, conn} ->
         {:error, :too_large, conn}
@@ -129,7 +136,7 @@ defmodule Minne do
          ) do
       {:ok, body, limit, conn} ->
         if Keyword.get(opts, :validate_utf8, true) and not unnamed? do
-          Plug.Conn.Utils.validate_utf8!(body, Plug.Parsers.BadEncodingError, "multipart body")
+          Utils.validate_utf8!(body, BadEncodingError, "multipart body")
         end
 
         value = if unnamed?, do: %{headers: headers, body: body}, else: body
@@ -267,19 +274,20 @@ defmodule Minne do
 
   defp scalar_limit!(name, opts) do
     case Keyword.fetch(opts, :allowed_scalar_fields) do
-      :error ->
-        :infinity
+      :error -> :infinity
+      {:ok, fields} -> fetch_scalar_limit!(fields, name)
+    end
+  end
 
-      {:ok, fields} ->
-        fields =
-          if Keyword.keyword?(fields),
-            do: Map.new(fields, fn {k, v} -> {to_string(k), v} end),
-            else: fields
+  defp fetch_scalar_limit!(fields, name) do
+    fields =
+      if Keyword.keyword?(fields),
+        do: Map.new(fields, fn {key, value} -> {to_string(key), value} end),
+        else: fields
 
-        case Map.fetch(fields, name) do
-          {:ok, limit} -> limit
-          :error -> raise "unexpected multipart scalar field"
-        end
+    case Map.fetch(fields, name) do
+      {:ok, limit} -> limit
+      :error -> raise "unexpected multipart scalar field"
     end
   end
 
@@ -320,7 +328,7 @@ defmodule Minne do
   defp abort_tracked(opts) do
     Enum.each(Process.get(@tracker, []), fn {module, upload} ->
       try do
-        apply(module, :abort, [upload, opts[:adapter_opts]])
+        module.abort(upload, opts[:adapter_opts])
       rescue
         error -> Logger.error("Minne adapter abort failed: #{Exception.message(error)}")
       end
@@ -344,7 +352,7 @@ defmodule Minne do
 
   defp multipart_type_from_disposition(headers, disposition, opts) do
     with [_, params] <- :binary.split(disposition, ";"),
-         %{"name" => name} = params <- Plug.Conn.Utils.params(params) do
+         %{"name" => name} = params <- Utils.params(params) do
       case params do
         %{"filename" => ""} ->
           {:empty_file, name}
@@ -358,9 +366,9 @@ defmodule Minne do
         %{"filename*" => "utf-8''" <> filename} ->
           filename = URI.decode(filename)
 
-          Plug.Conn.Utils.validate_utf8!(
+          Utils.validate_utf8!(
             filename,
-            Plug.Parsers.BadEncodingError,
+            BadEncodingError,
             "multipart filename"
           )
 
